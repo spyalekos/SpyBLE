@@ -1,0 +1,21 @@
+[project]
+name = "SpyBLE"
+version = "1.0.2"
+
+
+description = "A Flet BLE sensor monitoring application for Xiaomi devices"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flet>=0.86.5",
+    "bleak>=0.21.1",
+]
+
+[dependency-groups]
+dev = [
+    "pillow>=12.3.0",
+    "pyinstaller>=6.1.0",
+]
+
+[tool.flet.app]
+path = "src"
