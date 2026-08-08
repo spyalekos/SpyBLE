@@ -6,7 +6,7 @@ from config_manager import load_config, save_config
 from ble_manager import BLEState, BLEManager
 
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 
 
 
@@ -16,9 +16,10 @@ def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = "#0B0B0E"
     page.window.width = 1150
-    page.window.height = 820
+    page.window.height = 850
     page.window.resizable = True
     page.padding = 20
+    page.scroll = ft.ScrollMode.AUTO
 
 
     main_thread_id = threading.get_ident()
@@ -113,15 +114,14 @@ def main(page: ft.Page):
     device_list  = ft.ListView(spacing=8, expand=True)
 
     # ── Log Console (Multi-color ListView) ──────────────────────────────────
-    log_list = ft.ListView(spacing=4, expand=True, auto_scroll=True)
+    log_list = ft.ListView(spacing=4, height=210, auto_scroll=True)
     log_box  = ft.Container(
         content=log_list,
         bgcolor="#060609",
         border=ft.Border.all(1, "#1E293B"),
         border_radius=10,
         padding=12,
-        height=160,
-        expand=True
+        height=235
     )
 
     # ── Loop Controls ─────────────────────────────────────────────────────────
@@ -134,8 +134,9 @@ def main(page: ft.Page):
         label="Κάθε (δευτ.)",
         value=str(state.poll_interval),
         options=[
-            ft.dropdown.Option("10"), ft.dropdown.Option("30"),
-            ft.dropdown.Option("60"), ft.dropdown.Option("300"),
+            ft.dropdown.Option("5"), ft.dropdown.Option("10"),
+            ft.dropdown.Option("30"), ft.dropdown.Option("60"),
+            ft.dropdown.Option("300"),
         ],
         border_color="#334155", bgcolor="#1C1C25",
         height=44, content_padding=10, width=130,
@@ -150,7 +151,14 @@ def main(page: ft.Page):
         if state.thermometer_battery_v is not None:
             therm_batt.value = f"{state.thermometer_battery_v:.3f} V ({state.thermometer_battery_p}%)"
         therm_badge_text.value = state.thermometer_status.upper()
-        therm_badge.bgcolor = {"Connected":"#064E3B","Connecting":"#78350F","Disconnected":"#7F1D1D"}.get(state.thermometer_status, "#374151")
+        if "CONNECTING" in state.thermometer_status.upper():
+            therm_badge.bgcolor = "#B45309"  # Amber/Orange for retries
+        elif "CONNECTED" in state.thermometer_status.upper():
+            therm_badge.bgcolor = "#064E3B"  # Dark Emerald
+        elif "DISCONNECTED" in state.thermometer_status.upper():
+            therm_badge.bgcolor = "#7F1D1D"  # Dark Red
+        else:
+            therm_badge.bgcolor = "#374151"
         therm_time.value = f"Τελευταία: {state.thermometer_last_seen or 'Ποτέ'}"
 
         # Mi Flora
@@ -160,25 +168,41 @@ def main(page: ft.Page):
         if state.miflora_light     is not None: flora_light.value = f"{state.miflora_light} Lux"
         if state.miflora_battery   is not None: flora_batt.value  = f"{state.miflora_battery}%"
         flora_badge_text.value = state.miflora_status.upper()
-        flora_badge.bgcolor = {"Connected":"#064E3B","Connecting":"#78350F","Disconnected":"#7F1D1D"}.get(state.miflora_status, "#374151")
+        if "CONNECTING" in state.miflora_status.upper():
+            flora_badge.bgcolor = "#B45309"
+        elif "CONNECTED" in state.miflora_status.upper():
+            flora_badge.bgcolor = "#064E3B"
+        elif "DISCONNECTED" in state.miflora_status.upper():
+            flora_badge.bgcolor = "#7F1D1D"
+        else:
+            flora_badge.bgcolor = "#374151"
         flora_time.value = f"Τελευταία: {state.miflora_last_seen or 'Ποτέ'}"
 
         # Scanner
         scan_btn.disabled = state.is_scanning
         scan_ring.visible = state.is_scanning
         device_list.controls.clear()
+        def make_assign_click(mac_addr, sensor_type):
+            return lambda e: assign_mac(mac_addr, sensor_type)
+
         for dev in state.discovered_devices:
-            def mk_therm(a): return lambda e: assign_mac(a, "therm")
-            def mk_flora(a): return lambda e: assign_mac(a, "flora")
+            hw_mac = dev.get("hardware_mac", "")
+            target_mac = hw_mac if hw_mac else dev["address"]
+            
+            if hw_mac and hw_mac != dev["address"]:
+                mac_subtitle = f"HW: {hw_mac} (Win: {dev['address']})  RSSI: {dev['rssi']} dBm"
+            else:
+                mac_subtitle = f"{dev['address']}  RSSI: {dev['rssi']} dBm"
+
             device_list.controls.append(
                 ft.Container(
                     content=ft.Row([
                         ft.Column([
                             ft.Text(dev["name"], weight=ft.FontWeight.BOLD, size=13),
-                            ft.Text(f"{dev['address']}  RSSI: {dev['rssi']} dBm", size=11, color="#8F8F9F")
+                            ft.Text(mac_subtitle, size=11, color="#8F8F9F")
                         ], expand=True),
-                        ft.TextButton(content=ft.Text("Θερμ.", size=11, color="#F0B429"), on_click=mk_therm(dev["address"])),
-                        ft.TextButton(content=ft.Text("Flora", size=11, color="#34D399"), on_click=mk_flora(dev["address"])),
+                        ft.TextButton(content=ft.Text("Θερμ.", size=11, color="#F0B429"), on_click=make_assign_click(target_mac, "therm")),
+                        ft.TextButton(content=ft.Text("Flora", size=11, color="#34D399"), on_click=make_assign_click(target_mac, "flora")),
                     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                     bgcolor="#1C1C25", padding=ft.padding.Padding(10, 8, 10, 8), border_radius=8
                 )
@@ -232,10 +256,12 @@ def main(page: ft.Page):
     def assign_mac(mac, which):
         if which == "therm":
             state.thermometer_mac = mac
+            state.thermometer_has_data = False
             therm_mac_input.value = mac
             manager.log(f"Thermometer MAC → {mac}")
         else:
             state.miflora_mac = mac
+            state.miflora_has_data = False
             flora_mac_input.value = mac
             manager.log(f"Mi Flora MAC → {mac}")
         _save_cfg()
@@ -244,6 +270,8 @@ def main(page: ft.Page):
     def save_macs(e):
         state.thermometer_mac = therm_mac_input.value.strip()
         state.miflora_mac     = flora_mac_input.value.strip()
+        state.thermometer_has_data = False
+        state.miflora_has_data = False
         _save_cfg()
         manager.log("MACs αποθηκεύτηκαν.")
         update_ui()
@@ -332,7 +360,7 @@ def main(page: ft.Page):
             ft.Row([scan_btn, scan_ring], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             ft.Container(
                 content=device_list,
-                height=140,
+                height=160,
                 bgcolor="#0D0D14",
                 border=ft.Border.all(1, "#1E293B"),
                 border_radius=8,
@@ -343,19 +371,19 @@ def main(page: ft.Page):
         border=ft.Border.all(1, "#1E293B"),
         border_radius=16,
         padding=20,
-        width=400
+        width=520
     )
 
     log_panel = ft.Container(
         content=ft.Column([
-            ft.Text("Live Log", size=15, weight=ft.FontWeight.BOLD),
+            ft.Text("Live Log Console", size=15, weight=ft.FontWeight.BOLD),
             log_box
-        ], spacing=10, expand=True),
+        ], spacing=10),
         bgcolor="#111827",
         border=ft.Border.all(1, "#1E293B"),
         border_radius=16,
         padding=20,
-        expand=True
+        width=520
     )
 
     # ── Final Layout ──────────────────────────────────────────────────────────
@@ -376,9 +404,9 @@ def main(page: ft.Page):
             # Sensor cards
             ft.Row([therm_card, flora_card], spacing=16, wrap=True),
             ft.Divider(height=10, color="#1E293B"),
-            # Bottom row: setup + logs
-            ft.Row([setup_panel, log_panel], spacing=16, expand=True)
-        ], spacing=16, expand=True)
+            # Bottom row: setup + logs (wrap for smaller screens)
+            ft.Row([setup_panel, log_panel], spacing=16, wrap=True)
+        ], spacing=16, scroll=ft.ScrollMode.AUTO)
     )
 
     try:

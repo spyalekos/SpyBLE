@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 from config_manager import save_last_readings
@@ -10,20 +11,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SpyBLE")
 
 class BLEState:
-
     def __init__(self):
         # Thermometer config & data
         self.thermometer_mac = ""
-        self.thermometer_status = "Not configured"  # "Not configured", "Disconnected", "Connecting", "Connected", "Error"
+        self.thermometer_status = "Not configured"  # "Not configured", "Disconnected", "Connecting (x/y)", "Connected", "Connected (Passive)", "Error"
         self.thermometer_temp = None
         self.thermometer_humidity = None
         self.thermometer_battery_v = None
         self.thermometer_battery_p = None
         self.thermometer_last_seen = None
+        self.thermometer_last_seen_ts = 0.0
+        self.thermometer_has_data = False
 
         # Mi Flora config & data
         self.miflora_mac = ""
-        self.miflora_status = "Not configured"  # "Not configured", "Disconnected", "Connecting", "Connected", "Error"
+        self.miflora_status = "Not configured"
         self.miflora_temp = None
         self.miflora_moisture = None
         self.miflora_light = None
@@ -31,6 +33,8 @@ class BLEState:
         self.miflora_battery = None
         self.miflora_firmware = ""
         self.miflora_last_seen = None
+        self.miflora_last_seen_ts = 0.0
+        self.miflora_has_data = False
 
         # Global BLE states
         self.is_scanning = False
@@ -45,6 +49,8 @@ class BLEManager:
         self._thread = None
         self._loop = None
         self._loop_running = False
+        self._passive_scanner = None
+        self._device_cache = {}  # Map: MAC address (upper) or Payload MAC -> BLEDevice
 
     def log(self, message: str, color: str = None):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -55,11 +61,11 @@ class BLEManager:
             msg_lower = message.lower()
             if "error" in msg_lower or "failed" in msg_lower or "not found" in msg_lower:
                 color = "#FF7675"  # Red
-            elif "successful read" in msg_lower or "connected!" in msg_lower:
+            elif "successful" in msg_lower or "connected" in msg_lower or "✅" in msg_lower:
                 color = "#55E6C1"  # Mint Green
-            elif "connecting" in msg_lower or "starting" in msg_lower or "initializing" in msg_lower:
+            elif "connecting" in msg_lower or "starting" in msg_lower or "rapid" in msg_lower or "🚀" in msg_lower:
                 color = "#74B9FF"  # Cyan Blue
-            elif "scan complete" in msg_lower or "saved" in msg_lower:
+            elif "scan complete" in msg_lower or "saved" in msg_lower or "📡" in msg_lower or "found" in msg_lower:
                 color = "#FDCB6E"  # Gold Yellow
             else:
                 color = "#CED6E0"  # Soft Light Gray
@@ -81,23 +87,58 @@ class BLEManager:
             return
         
         self.state.is_scanning = True
-        self.log("Starting BLE scan for 5 seconds...")
+        self.log("Starting active BLE scan for 5 seconds...")
         self.state.discovered_devices = []
         self.trigger_ui_update()
         
         try:
             devices = await BleakScanner.discover(timeout=5.0, return_adv=True)
             discovered = []
+            seen_macs = set()
+
             for address, (device, adv_data) in devices.items():
                 name = device.name or "Unknown Device"
                 rssi = adv_data.rssi
                 uuids = adv_data.service_uuids
+                
+                # Check for embedded hardware MAC in advertisement service data
+                payload_mac = self._extract_payload_mac(adv_data)
+                if payload_mac:
+                    self._device_cache[payload_mac.upper()] = device
+                    seen_macs.add(payload_mac.upper())
+
+                self._device_cache[address.upper()] = device
+                seen_macs.add(address.upper())
+
                 discovered.append({
                     "address": address,
+                    "hardware_mac": payload_mac or "",
                     "name": name,
                     "rssi": rssi,
                     "services": uuids
                 })
+
+            # Ensure configured MACs (Thermometer & Mi Flora) always appear in scan results!
+            therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
+            if therm_mac and therm_mac not in seen_macs:
+                discovered.insert(0, {
+                    "address": therm_mac,
+                    "hardware_mac": therm_mac,
+                    "name": "LYWSD03MMC (Configured Thermometer)",
+                    "rssi": 0,
+                    "services": []
+                })
+
+            flora_mac = self.state.miflora_mac.strip().upper().replace("-", ":")
+            if flora_mac and flora_mac not in seen_macs:
+                discovered.insert(0, {
+                    "address": flora_mac,
+                    "hardware_mac": flora_mac,
+                    "name": "Mi Flora (Configured Sensor)",
+                    "rssi": 0,
+                    "services": []
+                })
+
             # Sort by RSSI (signal strength) descending
             discovered.sort(key=lambda x: x["rssi"], reverse=True)
             self.state.discovered_devices = discovered
@@ -108,57 +149,331 @@ class BLEManager:
             self.state.is_scanning = False
             self.trigger_ui_update()
 
-    async def read_thermometer(self, mac: str):
-        self.log(f"[Thermometer] Connecting to {mac}...")
-        async with BleakClient(mac, timeout=8.0) as client:
-            self.log(f"[Thermometer] Connected! Reading sensor characteristics...")
-            char_uuid = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
-            data = await client.read_gatt_char(char_uuid)
-            
-            if len(data) >= 5:
-                temp = (data[0] | (data[1] << 8)) * 0.01
-                humidity = data[2]
-                battery_mv = (data[3] | (data[4] << 8))
-                battery_v = battery_mv / 1000.0
-                battery_p = max(0, min(100, int((battery_v - 2.2) / 0.8 * 100)))
-                
-                self.log(f"[Thermometer] Successful read. Temp: {temp:.2f}°C, Humidity: {humidity}%, Battery: {battery_v:.3f}V ({battery_p}%)")
-                return temp, humidity, battery_v, battery_p
-            else:
-                raise ValueError(f"Incorrect data format, expected >= 5 bytes, got {len(data)} bytes.")
+    def _extract_payload_mac(self, adv_data):
+        """Extracts hardware MAC address from ATC/PVVX or Xiaomi MiBeacon advertisement payload if available."""
+        if not adv_data.service_data:
+            return None
+        
+        for uuid_raw, data in adv_data.service_data.items():
+            uuid_str = str(uuid_raw).lower()
+            if "181a" in uuid_str and len(data) >= 6: # ATC/PVVX payload
+                mac_bytes = data[:6]
+                return ":".join(f"{b:02X}" for b in mac_bytes)
+            elif "fe95" in uuid_str and len(data) >= 10: # MiBeacon payload
+                frame_ctrl = data[0] | (data[1] << 8)
+                if frame_ctrl & 0x10 and len(data) >= 11: # MAC bit set
+                    mac_bytes = bytes(reversed(data[5:11]))
+                    return ":".join(f"{b:02X}" for b in mac_bytes)
+        return None
 
-    async def read_miflora(self, mac: str):
-        self.log(f"[Mi Flora] Connecting to {mac}...")
-        async with BleakClient(mac, timeout=8.0) as client:
-            self.log(f"[Mi Flora] Connected! Initializing sensor read mode...")
-            mode_uuid = "00001a00-0000-1000-8000-00805f9b34fb"
-            await client.write_gatt_char(mode_uuid, bytearray([0xA0, 0x1F]), response=True)
+    async def _get_ble_device(self, target_mac: str, timeout: float = 2.5):
+        """Finds BLEDevice object required by Windows WinRT BLE stack."""
+        clean_mac = target_mac.strip().upper().replace("-", ":")
+        if not clean_mac:
+            return None
             
-            self.log(f"[Mi Flora] Reading sensor data characteristic...")
-            data_uuid = "00001a01-0000-1000-8000-00805f9b34fb"
-            data = await client.read_gatt_char(data_uuid)
+        # 1. Check active cache
+        if clean_mac in self._device_cache:
+            return self._device_cache[clean_mac]
             
-            self.log(f"[Mi Flora] Reading battery & firmware characteristic...")
-            battery_uuid = "00001a02-0000-1000-8000-00805f9b34fb"
-            battery_data = await client.read_gatt_char(battery_uuid)
+        # 2. Try BleakScanner.find_device_by_address directly
+        try:
+            device = await BleakScanner.find_device_by_address(clean_mac, timeout=timeout)
+            if device:
+                self._device_cache[clean_mac] = device
+                return device
+        except Exception:
+            pass
+
+        # 3. Discover scan to resolve random address / payload MAC match
+        try:
+            devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+            for addr, (dev, adv_data) in devices.items():
+                addr_upper = addr.upper()
+                self._device_cache[addr_upper] = dev
+                payload_mac = self._extract_payload_mac(adv_data)
+                if payload_mac:
+                    self._device_cache[payload_mac.upper()] = dev
+
+                if addr_upper == clean_mac or (payload_mac and payload_mac.upper() == clean_mac):
+                    self.log(f"Matched BLE Device: {dev.name or 'Unknown'} ({addr}) for MAC {clean_mac}", color="#FDCB6E")
+                    return dev
+        except Exception as e:
+            logger.error(f"Error resolving BLE device: {e}")
+
+        return None
+
+    # ── Method 2: Rapid Shooting Mode (GATT Connection Retries) ────────────────
+
+    async def read_thermometer_rapid(self, mac: str, max_retries: int = 20, retry_delay: float = 0.3):
+        """Rapid shooting mode: keep firing connection requests until data is received."""
+        clean_mac = mac.strip().upper().replace("-", ":")
+        self.log(f"[Thermometer] 🚀 Rapid Shooting Mode started for {clean_mac} (max {max_retries} retries)...", color="#74B9FF")
+        
+        for attempt in range(1, max_retries + 1):
+            if not self._loop_running:
+                break
             
-            if len(data) >= 16:
-                temp = int.from_bytes(data[0:2], byteorder='little') / 10.0
-                light = int.from_bytes(data[3:7], byteorder='little')
-                moisture = data[7]
-                fertility = int.from_bytes(data[8:10], byteorder='little')
+            self.state.thermometer_status = f"Connecting ({attempt}/{max_retries})"
+            self.trigger_ui_update()
+            
+            # Resolve BLEDevice object for Windows stack compatibility
+            ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
+            target = ble_device if ble_device else clean_mac
+            
+            target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
+            self.log(f"[Thermometer] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
+            
+            try:
+                async with BleakClient(target, timeout=4.0) as client:
+                    self.log(f"[Thermometer] Connected on attempt #{attempt}! Reading characteristic...")
+                    char_uuid = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
+                    data = await client.read_gatt_char(char_uuid)
+                    
+                    if len(data) >= 5:
+                        temp = (data[0] | (data[1] << 8)) * 0.01
+                        humidity = data[2]
+                        battery_mv = (data[3] | (data[4] << 8))
+                        battery_v = battery_mv / 1000.0
+                        battery_p = max(0, min(100, int((battery_v - 2.2) / 0.8 * 100)))
+                        
+                        self.log(f"[Thermometer] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.2f}°C, Humidity: {humidity}%, Battery: {battery_v:.3f}V ({battery_p}%)", color="#55E6C1")
+                        return temp, humidity, battery_v, battery_p
+                    else:
+                        raise ValueError(f"Unexpected data length: {len(data)} bytes.")
+            except Exception as e:
+                err_msg = str(e) or "Connection timeout"
+                self.log(f"[Thermometer] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
+                await asyncio.sleep(retry_delay)
+
+        raise TimeoutError(f"Thermometer {clean_mac} failed to respond after {max_retries} rapid attempts.")
+
+    async def read_miflora_rapid(self, mac: str, max_retries: int = 20, retry_delay: float = 0.3):
+        """Rapid shooting mode for Mi Flora sensor."""
+        clean_mac = mac.strip().upper().replace("-", ":")
+        self.log(f"[Mi Flora] 🚀 Rapid Shooting Mode started for {clean_mac} (max {max_retries} retries)...", color="#74B9FF")
+        
+        for attempt in range(1, max_retries + 1):
+            if not self._loop_running:
+                break
+            
+            self.state.miflora_status = f"Connecting ({attempt}/{max_retries})"
+            self.trigger_ui_update()
+            
+            ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
+            target = ble_device if ble_device else clean_mac
+            
+            target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
+            self.log(f"[Mi Flora] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
+            
+            try:
+                async with BleakClient(target, timeout=4.0) as client:
+                    mode_uuid = "00001a00-0000-1000-8000-00805f9b34fb"
+                    await client.write_gatt_char(mode_uuid, bytearray([0xA0, 0x1F]), response=True)
+                    
+                    data_uuid = "00001a01-0000-1000-8000-00805f9b34fb"
+                    data = await client.read_gatt_char(data_uuid)
+                    
+                    battery_uuid = "00001a02-0000-1000-8000-00805f9b34fb"
+                    battery_data = await client.read_gatt_char(battery_uuid)
+                    
+                    if len(data) >= 16:
+                        temp = int.from_bytes(data[0:2], byteorder='little') / 10.0
+                        light = int.from_bytes(data[3:7], byteorder='little')
+                        moisture = data[7]
+                        fertility = int.from_bytes(data[8:10], byteorder='little')
+                        
+                        battery = battery_data[0] if len(battery_data) >= 1 else 0
+                        firmware = battery_data[1:].decode('ascii', errors='ignore').strip() if len(battery_data) > 1 else "Unknown"
+                        
+                        self.log(f"[Mi Flora] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.1f}°C, Moisture: {moisture}%, Light: {light} lux, Fertility: {fertility} µS/cm", color="#55E6C1")
+                        return temp, moisture, light, fertility, battery, firmware
+                    else:
+                        raise ValueError(f"Unexpected data length: {len(data)} bytes.")
+            except Exception as e:
+                err_msg = str(e) or "Connection timeout"
+                self.log(f"[Mi Flora] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
+                await asyncio.sleep(retry_delay)
+
+        raise TimeoutError(f"Mi Flora {clean_mac} failed to respond after {max_retries} rapid attempts.")
+
+    # ── Method 3: Passive BLE Advertisement Decoder ─────────────────────────
+
+    def _parse_passive_adv(self, device, adv_data):
+        addr = device.address.upper()
+        self._device_cache[addr] = device
+        
+        payload_mac = self._extract_payload_mac(adv_data)
+        if payload_mac:
+            self._device_cache[payload_mac.upper()] = device
+
+        therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
+        miflora_mac = self.state.miflora_mac.strip().upper().replace("-", ":")
+        now_str = datetime.now().strftime("%H:%M:%S")
+
+        # Match Thermometer MAC (by OS Bluetooth address OR by hardware payload MAC)
+        if therm_mac and (addr == therm_mac or (payload_mac and payload_mac.upper() == therm_mac)):
+            parsed = self._decode_thermometer_adv(adv_data)
+            if parsed:
+                if "temp" in parsed and parsed["temp"] is not None:
+                    self.state.thermometer_temp = parsed["temp"]
+                if "humidity" in parsed and parsed["humidity"] is not None:
+                    self.state.thermometer_humidity = parsed["humidity"]
+                if "battery_v" in parsed and parsed["battery_v"] is not None:
+                    self.state.thermometer_battery_v = parsed["battery_v"]
+                if "battery_p" in parsed and parsed["battery_p"] is not None:
+                    self.state.thermometer_battery_p = parsed["battery_p"]
                 
-                battery = 0
-                firmware = "Unknown"
-                if len(battery_data) >= 1:
-                    battery = battery_data[0]
-                if len(battery_data) > 1:
-                    firmware = battery_data[1:].decode('ascii', errors='ignore').strip()
+                self.state.thermometer_status = "Connected (Passive)"
+                self.state.thermometer_last_seen = now_str
+                self.state.thermometer_last_seen_ts = time.time()
+                self.state.thermometer_has_data = True
                 
-                self.log(f"[Mi Flora] Successful read. Temp: {temp:.1f}°C, Moisture: {moisture}%, Light: {light} lux, Fertility: {fertility} uS/cm, Battery: {battery}%")
-                return temp, moisture, light, fertility, battery, firmware
+                save_last_readings("thermometer", {
+                    "temp": self.state.thermometer_temp,
+                    "humidity": self.state.thermometer_humidity,
+                    "battery_v": self.state.thermometer_battery_v,
+                    "battery_p": self.state.thermometer_battery_p,
+                    "last_seen": now_str
+                })
+                self.log(f"[Thermometer] 📡 Passive Advertisement: {self.state.thermometer_temp:.1f}°C, Hum: {self.state.thermometer_humidity}%", color="#2ECC71")
+                self.trigger_ui_update()
+
+        # Match Mi Flora MAC
+        if miflora_mac and (addr == miflora_mac or (payload_mac and payload_mac.upper() == miflora_mac)):
+            parsed = self._decode_miflora_adv(adv_data)
+            if parsed:
+                if "temp" in parsed: self.state.miflora_temp = parsed["temp"]
+                if "moisture" in parsed: self.state.miflora_moisture = parsed["moisture"]
+                if "light" in parsed: self.state.miflora_light = parsed["light"]
+                if "fertility" in parsed: self.state.miflora_fertility = parsed["fertility"]
+                if "battery" in parsed: self.state.miflora_battery = parsed["battery"]
+                
+                self.state.miflora_status = "Connected (Passive)"
+                self.state.miflora_last_seen = now_str
+                self.state.miflora_last_seen_ts = time.time()
+                self.state.miflora_has_data = True
+
+                save_last_readings("miflora", {
+                    "temp": self.state.miflora_temp,
+                    "moisture": self.state.miflora_moisture,
+                    "light": self.state.miflora_light,
+                    "fertility": self.state.miflora_fertility,
+                    "battery": self.state.miflora_battery,
+                    "firmware": self.state.miflora_firmware,
+                    "last_seen": now_str
+                })
+                self.log(f"[Mi Flora] 📡 Passive Advertisement update received!", color="#2ECC71")
+                self.trigger_ui_update()
+
+    def _decode_thermometer_adv(self, adv_data):
+        res = {}
+        service_data = adv_data.service_data
+        if not service_data:
+            return None
+
+        for uuid_raw, data in service_data.items():
+            uuid_str = str(uuid_raw).lower()
+
+            # 1. Custom ATC / PVVX format (UUID 0x181A)
+            if "181a" in uuid_str:
+                if len(data) >= 13: # ATC1441 format
+                    temp = int.from_bytes(data[6:8], byteorder='big', signed=True) / 10.0
+                    hum = data[8]
+                    batt_p = data[9]
+                    batt_mv = int.from_bytes(data[10:12], byteorder='big')
+                    res.update({"temp": temp, "humidity": hum, "battery_p": batt_p, "battery_v": batt_mv / 1000.0})
+                elif len(data) >= 10: # PVVX format
+                    temp = int.from_bytes(data[6:8], byteorder='little', signed=True) / 100.0
+                    hum = int.from_bytes(data[8:10], byteorder='little') / 100.0
+                    res.update({"temp": temp, "humidity": hum})
+                    if len(data) >= 11:
+                        res["battery_p"] = data[10]
+                    if len(data) >= 13:
+                        res["battery_v"] = int.from_bytes(data[11:13], byteorder='little') / 1000.0
+
+            # 2. Standard Xiaomi MiBeacon (0xFE95)
+            elif "fe95" in uuid_str:
+                mibeacon = self._parse_mibeacon(data)
+                if mibeacon:
+                    res.update(mibeacon)
+
+            # 3. BTHome format (0xFCD2)
+            elif "fcd2" in uuid_str:
+                bthome = self._parse_bthome(data)
+                if bthome:
+                    res.update(bthome)
+
+        return res if res else None
+
+    def _decode_miflora_adv(self, adv_data):
+        service_data = adv_data.service_data
+        if not service_data:
+            return None
+        res = {}
+        for uuid_raw, data in service_data.items():
+            uuid_str = str(uuid_raw).lower()
+            if "fe95" in uuid_str:
+                parsed = self._parse_mibeacon(data)
+                if parsed:
+                    res.update(parsed)
+        return res if res else None
+
+    def _parse_mibeacon(self, data: bytes):
+        if len(data) < 5:
+            return None
+        frame_ctrl = data[0] | (data[1] << 8)
+        has_mac = bool(frame_ctrl & 0x10)
+        offset = 11 if has_mac else 5
+        
+        readings = {}
+        while offset + 3 <= len(data):
+            event_id = data[offset] | (data[offset+1] << 8)
+            event_len = data[offset+2]
+            payload = data[offset+3 : offset+3+event_len]
+            offset += 3 + event_len
+            
+            if event_id == 0x0D and len(payload) >= 4:
+                readings['temp'] = int.from_bytes(payload[0:2], 'little', signed=True) / 10.0
+                readings['humidity'] = int.from_bytes(payload[2:4], 'little') / 10.0
+            elif event_id == 0x04 and len(payload) >= 2:
+                readings['temp'] = int.from_bytes(payload[0:2], 'little', signed=True) / 10.0
+            elif event_id == 0x06 and len(payload) >= 2:
+                readings['humidity'] = int.from_bytes(payload[0:2], 'little') / 10.0
+            elif event_id == 0x0A and len(payload) >= 1:
+                readings['battery_p'] = payload[0]
+            elif event_id == 0x07 and len(payload) >= 3:
+                readings['light'] = payload[0] | (payload[1] << 8) | (payload[2] << 16)
+            elif event_id == 0x08 and len(payload) >= 1:
+                readings['moisture'] = payload[0]
+            elif event_id == 0x09 and len(payload) >= 2:
+                readings['fertility'] = int.from_bytes(payload[0:2], 'little')
+        return readings
+
+    def _parse_bthome(self, data: bytes):
+        if len(data) < 3:
+            return None
+        offset = 1
+        readings = {}
+        while offset + 2 <= len(data):
+            obj_id = data[offset]
+            offset += 1
+            if obj_id == 0x02 and offset + 2 <= len(data):
+                val = int.from_bytes(data[offset:offset+2], 'little', signed=True)
+                readings['temp'] = val * 0.01
+                offset += 2
+            elif obj_id == 0x03 and offset + 2 <= len(data):
+                val = int.from_bytes(data[offset:offset+2], 'little')
+                readings['humidity'] = val * 0.01
+                offset += 2
+            elif obj_id == 0x01 and offset + 1 <= len(data):
+                readings['battery_p'] = data[offset]
+                offset += 1
             else:
-                raise ValueError(f"Incorrect data format, expected >= 16 bytes, got {len(data)} bytes.")
+                break
+        return readings
+
+    # ── Background Thread Management ──────────────────────────────────────────
 
     def start_monitoring(self):
         if self._loop_running:
@@ -167,7 +482,6 @@ class BLEManager:
         self._loop_running = True
         self.log("Starting BLE background monitoring thread...")
         
-        # Start a dedicated background thread for BLE polling
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -186,20 +500,11 @@ class BLEManager:
             self._thread = None
             
         # Reset statuses
-        if self.state.thermometer_mac:
-            self.state.thermometer_status = "Disconnected"
-        else:
-            self.state.thermometer_status = "Not configured"
-            
-        if self.state.miflora_mac:
-            self.state.miflora_status = "Disconnected"
-        else:
-            self.state.miflora_status = "Not configured"
-            
+        self.state.thermometer_status = "Disconnected" if self.state.thermometer_mac else "Not configured"
+        self.state.miflora_status = "Disconnected" if self.state.miflora_mac else "Not configured"
         self.trigger_ui_update()
 
     def _run_loop(self):
-        # Create a private event loop for the background thread
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
@@ -212,15 +517,28 @@ class BLEManager:
             self._loop.close()
 
     async def _main_monitoring(self):
-        self.log("BLE monitoring thread loops initialized.")
-        # Gather loops concurrently on the background thread loop
+        self.log("BLE monitoring active with Method 2 (Rapid Retries) and Method 3 (Passive Listener).")
         await asyncio.gather(
+            self._passive_scanner_loop(),
             self._thermometer_loop(),
             self._miflora_loop()
         )
 
+    async def _passive_scanner_loop(self):
+        def callback(device, adv_data):
+            self._parse_passive_adv(device, adv_data)
+
+        self.log("📡 [Method 3] Passive BLE Scanner active in background.")
+        try:
+            scanner = BleakScanner(detection_callback=callback)
+            await scanner.start()
+            while self._loop_running:
+                await asyncio.sleep(1.0)
+            await scanner.stop()
+        except Exception as e:
+            logger.error(f"Passive scanner loop error: {e}")
+
     async def _thermometer_loop(self):
-        # Give Flet UI plenty of time to render before starting BLE connections
         await asyncio.sleep(1.0)
         while self._loop_running:
             mac = self.state.thermometer_mac
@@ -230,38 +548,46 @@ class BLEManager:
                 await asyncio.sleep(2.0)
                 continue
             
-            self.state.thermometer_status = "Connecting"
-            self.trigger_ui_update()
-            
-            try:
-                temp, humidity, battery_v, battery_p = await self.read_thermometer(mac)
-                now_str = datetime.now().strftime("%H:%M:%S")
-                self.state.thermometer_temp = temp
-                self.state.thermometer_humidity = humidity
-                self.state.thermometer_battery_v = battery_v
-                self.state.thermometer_battery_p = battery_p
-                self.state.thermometer_status = "Connected"
-                self.state.thermometer_last_seen = now_str
+            # Check if we need initial data acquisition (Method 2: Rapid Retries)
+            if not self.state.thermometer_has_data:
+                try:
+                    temp, humidity, battery_v, battery_p = await self.read_thermometer_rapid(mac, max_retries=20, retry_delay=0.3)
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    self.state.thermometer_temp = temp
+                    self.state.thermometer_humidity = humidity
+                    self.state.thermometer_battery_v = battery_v
+                    self.state.thermometer_battery_p = battery_p
+                    self.state.thermometer_status = "Connected"
+                    self.state.thermometer_last_seen = now_str
+                    self.state.thermometer_last_seen_ts = time.time()
+                    self.state.thermometer_has_data = True
 
-                # Save reading for persistence across restarts
-                save_last_readings("thermometer", {
-                    "temp": temp,
-                    "humidity": humidity,
-                    "battery_v": battery_v,
-                    "battery_p": battery_p,
-                    "last_seen": now_str
-                })
-            except Exception as e:
-                self.state.thermometer_status = "Disconnected"
-                self.log(f"[Thermometer] Error: {str(e)}")
-            
+                    save_last_readings("thermometer", {
+                        "temp": temp,
+                        "humidity": humidity,
+                        "battery_v": battery_v,
+                        "battery_p": battery_p,
+                        "last_seen": now_str
+                    })
+                except Exception as e:
+                    self.state.thermometer_status = "Disconnected"
+                    self.log(f"[Thermometer] Rapid shooting paused ({str(e)}). Retrying cycle in 3s...")
+                    await asyncio.sleep(3.0)
+                    continue
+
             self.trigger_ui_update()
             
-            # Poll interval sleep
+            # Method 3 is active: sleep for poll_interval, refreshing via rapid shooting only if passive packets stall
             for _ in range(int(self.state.poll_interval)):
                 if not self._loop_running:
                     break
                 await asyncio.sleep(1.0)
+            
+            # Check if passive updates haven't arrived recently (older than poll_interval * 1.5)
+            time_since_last = time.time() - self.state.thermometer_last_seen_ts
+            if time_since_last > (self.state.poll_interval * 1.5):
+                self.log(f"[Thermometer] Data stale ({int(time_since_last)}s since update). Re-firing rapid shooting mode...")
+                self.state.thermometer_has_data = False
 
     async def _miflora_loop(self):
         await asyncio.sleep(1.0)
@@ -273,40 +599,44 @@ class BLEManager:
                 await asyncio.sleep(2.0)
                 continue
             
-            self.state.miflora_status = "Connecting"
-            self.trigger_ui_update()
-            
-            try:
-                temp, moisture, light, fertility, battery, firmware = await self.read_miflora(mac)
-                now_str = datetime.now().strftime("%H:%M:%S")
-                self.state.miflora_temp = temp
-                self.state.miflora_moisture = moisture
-                self.state.miflora_light = light
-                self.state.miflora_fertility = fertility
-                self.state.miflora_battery = battery
-                self.state.miflora_firmware = firmware
-                self.state.miflora_status = "Connected"
-                self.state.miflora_last_seen = now_str
+            if not self.state.miflora_has_data:
+                try:
+                    temp, moisture, light, fertility, battery, firmware = await self.read_miflora_rapid(mac, max_retries=20, retry_delay=0.3)
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    self.state.miflora_temp = temp
+                    self.state.miflora_moisture = moisture
+                    self.state.miflora_light = light
+                    self.state.miflora_fertility = fertility
+                    self.state.miflora_battery = battery
+                    self.state.miflora_firmware = firmware
+                    self.state.miflora_status = "Connected"
+                    self.state.miflora_last_seen = now_str
+                    self.state.miflora_last_seen_ts = time.time()
+                    self.state.miflora_has_data = True
 
-                # Save reading for persistence across restarts
-                save_last_readings("miflora", {
-                    "temp": temp,
-                    "moisture": moisture,
-                    "light": light,
-                    "fertility": fertility,
-                    "battery": battery,
-                    "firmware": firmware,
-                    "last_seen": now_str
-                })
-            except Exception as e:
-                self.state.miflora_status = "Disconnected"
-                self.log(f"[Mi Flora] Error: {str(e)}")
-            
+                    save_last_readings("miflora", {
+                        "temp": temp,
+                        "moisture": moisture,
+                        "light": light,
+                        "fertility": fertility,
+                        "battery": battery,
+                        "firmware": firmware,
+                        "last_seen": now_str
+                    })
+                except Exception as e:
+                    self.state.miflora_status = "Disconnected"
+                    self.log(f"[Mi Flora] Rapid shooting paused ({str(e)}). Retrying cycle in 3s...")
+                    await asyncio.sleep(3.0)
+                    continue
+
             self.trigger_ui_update()
             
-            # Poll interval sleep
             for _ in range(int(self.state.poll_interval)):
                 if not self._loop_running:
                     break
                 await asyncio.sleep(1.0)
-
+                
+            time_since_last = time.time() - self.state.miflora_last_seen_ts
+            if time_since_last > (self.state.poll_interval * 1.5):
+                self.log(f"[Mi Flora] Data stale ({int(time_since_last)}s since update). Re-firing rapid shooting mode...")
+                self.state.miflora_has_data = False

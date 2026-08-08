@@ -1,7 +1,8 @@
 import json
 import os
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = "spyBLE.settings"
+OLD_CONFIG_FILE = "config.json"
 
 def load_config():
     default_config = {
@@ -14,6 +15,16 @@ def load_config():
             "miflora": {}
         }
     }
+    
+    # Seamlessly migrate config.json -> spyBLE.settings if old file exists
+    if not os.path.exists(CONFIG_FILE) and os.path.exists(OLD_CONFIG_FILE):
+        try:
+            with open(OLD_CONFIG_FILE, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+                save_config(old_data)
+        except Exception:
+            pass
+
     if not os.path.exists(CONFIG_FILE):
         save_config(default_config)
         return default_config
@@ -21,7 +32,6 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Ensure default keys exist
             for k, v in default_config.items():
                 if k not in data:
                     data[k] = v
