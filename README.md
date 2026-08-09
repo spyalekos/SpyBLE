@@ -1,6 +1,6 @@
 # SpyBLE 📶 - Xiaomi BLE Sensor Dashboard
 
-![SpyBLE Icon](src/assets/icon.png)
+![SpyBLE Icon](assets/icon.png)
 
 > **SpyBLE** είναι μια σύγχρονη desktop εφαρμογή (Python / Flet / Bleak) για τον ζωντανό έλεγχο και την παρακολούθηση αισθητήρων Bluetooth Low Energy (BLE) της Xiaomi (Θερμόμετρα LYWSD03MMC και Αισθητήρες Φυτών Mi Flora / VegTrug).
 
