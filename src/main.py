@@ -1066,41 +1066,59 @@ def main(page: ft.Page):
                 page.snack_bar.open = True
                 page.update()
 
-        # ── Final Layout ──────────────────────────────────────────────────────────
-        main_tabs = ft.Tabs(
-            selected_index=0,
-            animation_duration=250,
-            tabs=[
-                ft.Tab(
-                    text="📊 Ζωντανή Επισκόπηση",
-                    icon=ft.Icons.DASHBOARD,
-                    content=ft.Container(
-                        content=ft.Column([
-                            ft.Row([therm_card, flora_card], spacing=16, wrap=True),
-                            ft.Divider(height=10, color="#1E293B"),
-                            ft.Row([setup_panel, log_panel], spacing=16, wrap=True)
-                        ], spacing=16),
-                        padding=ft.padding.only(top=14)
-                    )
-                ),
-                ft.Tab(
-                    text="🌡️ Ιστορικό Θερμομέτρου",
-                    icon=ft.Icons.THERMOMETER,
-                    content=ft.Container(
-                        content=therm_history_panel,
-                        padding=ft.padding.only(top=14)
-                    )
-                ),
-                ft.Tab(
-                    text="🌿 Ιστορικό Mi Flora",
-                    icon=ft.Icons.LOCAL_FLORIST,
-                    content=ft.Container(
-                        content=flora_history_panel,
-                        padding=ft.padding.only(top=14)
-                    )
-                ),
-            ]
+        # ── Final Layout with Page Navigation Bar ───────────────────────────────
+        dashboard_view = ft.Column([
+            ft.Row([therm_card, flora_card], spacing=16, wrap=True),
+            ft.Divider(height=10, color="#1E293B"),
+            ft.Row([setup_panel, log_panel], spacing=16, wrap=True)
+        ], spacing=16)
+
+        active_page_container = ft.Container(content=dashboard_view)
+
+        def switch_tab(tab_name):
+            if tab_name == "dashboard":
+                active_page_container.content = dashboard_view
+                btn_tab_dashboard.bgcolor = "#3B82F6"
+                btn_tab_dashboard.color = "#FFFFFF"
+                btn_tab_therm_hist.bgcolor = "#1E293B"
+                btn_tab_therm_hist.color = "#94A3B8"
+                btn_tab_flora_hist.bgcolor = "#1E293B"
+                btn_tab_flora_hist.color = "#94A3B8"
+            elif tab_name == "therm_hist":
+                active_page_container.content = therm_history_panel
+                btn_tab_dashboard.bgcolor = "#1E293B"
+                btn_tab_dashboard.color = "#94A3B8"
+                btn_tab_therm_hist.bgcolor = "#F0B429"
+                btn_tab_therm_hist.color = "#FFFFFF"
+                btn_tab_flora_hist.bgcolor = "#1E293B"
+                btn_tab_flora_hist.color = "#94A3B8"
+            elif tab_name == "flora_hist":
+                active_page_container.content = flora_history_panel
+                btn_tab_dashboard.bgcolor = "#1E293B"
+                btn_tab_dashboard.color = "#94A3B8"
+                btn_tab_therm_hist.bgcolor = "#1E293B"
+                btn_tab_therm_hist.color = "#94A3B8"
+                btn_tab_flora_hist.bgcolor = "#34D399"
+                btn_tab_flora_hist.color = "#FFFFFF"
+            safe_update()
+
+        btn_tab_dashboard = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.DASHBOARD, size=16), ft.Text("📊 Ζωντανή Επισκόπηση", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#3B82F6", color="#FFFFFF", height=40,
+            on_click=lambda e: switch_tab("dashboard")
         )
+        btn_tab_therm_hist = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.THERMOSTAT, size=16), ft.Text("🌡️ Ιστορικό Θερμομέτρου", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#1E293B", color="#94A3B8", height=40,
+            on_click=lambda e: switch_tab("therm_hist")
+        )
+        btn_tab_flora_hist = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.LOCAL_FLORIST, size=16), ft.Text("🌿 Ιστορικό Mi Flora", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#1E293B", color="#94A3B8", height=40,
+            on_click=lambda e: switch_tab("flora_hist")
+        )
+
+        nav_bar = ft.Row([btn_tab_dashboard, btn_tab_therm_hist, btn_tab_flora_hist], spacing=10, wrap=True)
 
         page.add(
             ft.Column([
@@ -1116,7 +1134,9 @@ def main(page: ft.Page):
                     ft.Row([loop_switch, interval_dd, help_btn], spacing=12)
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 ft.Divider(height=10, color="#1E293B"),
-                main_tabs
+                nav_bar,
+                ft.Divider(height=10, color="#1E293B"),
+                active_page_container
             ], spacing=14, scroll=ft.ScrollMode.AUTO)
         )
 
