@@ -919,8 +919,8 @@ def main(page: ft.Page):
                                 ft.Text(ts, size=12, weight=ft.FontWeight.BOLD, color="#CBD5E1")
                             ], spacing=6),
                             ft.Row([
-                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f} °C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=t_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
-                                ft.Container(content=ft.Text(f"💧 {h_val} %", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=h_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f} °C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=t_col, padding=ft.Padding(8, 3, 8, 3), border_radius=6),
+                                ft.Container(content=ft.Text(f"💧 {h_val} %", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=h_col, padding=ft.Padding(8, 3, 8, 3), border_radius=6),
                             ], spacing=8)
                         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                         bgcolor="#1C1C25", border_radius=8, padding=8
@@ -964,10 +964,10 @@ def main(page: ft.Page):
                                 ft.Text(ts, size=12, weight=ft.FontWeight.BOLD, color="#CBD5E1")
                             ], spacing=6),
                             ft.Row([
-                                ft.Container(content=ft.Text(f"💧 {m_val}%", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=m_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
-                                ft.Container(content=ft.Text(f"🧪 {f_val}µS", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=f_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
-                                ft.Container(content=ft.Text(f"☀️ {l_val}Lx", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#D97706", padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
-                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f}°C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#475569", padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"💧 {m_val}%", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=m_col, padding=ft.Padding(8, 3, 8, 3), border_radius=6),
+                                ft.Container(content=ft.Text(f"🧪 {f_val}µS", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=f_col, padding=ft.Padding(8, 3, 8, 3), border_radius=6),
+                                ft.Container(content=ft.Text(f"☀️ {l_val}Lx", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#D97706", padding=ft.Padding(8, 3, 8, 3), border_radius=6),
+                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f}°C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#475569", padding=ft.Padding(8, 3, 8, 3), border_radius=6),
                             ], spacing=6)
                         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                         bgcolor="#1C1C25", border_radius=8, padding=8
