@@ -1,6 +1,6 @@
 [project]
 name = "SpyBLE"
-version = "1.6.2"
+version = "1.6.3"
 
 
 description = "A Flet BLE sensor monitoring application for Xiaomi devices"
