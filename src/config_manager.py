@@ -13,7 +13,9 @@ def load_config():
         "last_readings": {
             "thermometer": {},
             "miflora": {}
-        }
+        },
+        "history_thermometer": [],
+        "history_miflora": []
     }
     
     # Seamlessly migrate config.json -> spyBLE.settings if old file exists
@@ -67,4 +69,16 @@ def save_last_readings(sensor_type, readings_dict):
         return True
     except Exception:
         return False
+
+def save_history(sensor_type, history_list):
+    try:
+        config = load_config()
+        key = f"history_{sensor_type}"
+        config[key] = history_list
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
 

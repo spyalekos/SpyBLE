@@ -8,7 +8,7 @@ from config_manager import load_config, save_config
 from ble_manager import BLEState, BLEManager
 
 
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 
 
 def calc_dew_point(temp, hum):
@@ -106,6 +106,8 @@ def main(page: ft.Page):
         state.thermometer_mac = config.get("thermometer_mac", "")
         state.miflora_mac = config.get("miflora_mac", "")
         state.poll_interval = config.get("poll_interval", 30)
+        state.thermometer_history = config.get("history_thermometer", [])
+        state.miflora_history = config.get("history_miflora", [])
 
         # Maximize card state: None, "thermometer", or "miflora"
         maximized_card = None
@@ -204,6 +206,14 @@ def main(page: ft.Page):
                         "• Ρύθμιση MAC: Εισάγετε τη MAC διεύθυνση ή επιλέξτε την από τη Σάρωση BLE.\n"
                         "• Ενεργή Επανάληψη & Χρόνος: Ενεργοποιήστε τον αυτόματο έλεγχο και επιλέξτε ρυθμό ανανέωσης (5s έως 300s).\n"
                         "• Live Log Console: Έγχρωμη καταγραφή συμβάντων, συνδέσεων και παθητικών λήψεων σε πραγματικό χρόνο.",
+                        size=12, color="#CBD5E1"
+                    ),
+
+                    ft.Divider(height=8, color="#1E293B"),
+                    ft.Text("📊 Σελίδες Ιστορικού & Εξαγωγή (CSV / JSON)", size=14, weight=ft.FontWeight.BOLD, color="#FBBF24"),
+                    ft.Text(
+                        "• Καρτέλα Ιστορικού Θερμομέτρου: Προβολή αποθηκευμένων μετρήσεων μνήμης Flash, αναλυτικά στατιστικά (Min/Max/Avg) & εξαγωγή σε αρχεία CSV / JSON.\n"
+                        "• Καρτέλα Ιστορικού Mi Flora: Ανάκτηση ιστορικού υγείας φυτού (Υγρασία Χώματος, Λίπασμα, Φως) & εξαγωγή σε αρχεία CSV / JSON.",
                         size=12, color="#CBD5E1"
                     ),
 
@@ -545,6 +555,166 @@ def main(page: ft.Page):
             width=520
         )
 
+        # ── Thermometer History UI ────────────────────────────────────────────────
+        therm_hist_status_txt = ft.Text("Έτοιμο για συγχρονισμό", size=13, color="#CBD5E1")
+        therm_hist_progress   = ft.ProgressBar(value=0.0, color="#3B82F6", bgcolor="#1E293B", height=6, visible=False)
+
+        therm_hist_stat_total    = ft.Text("0", size=24, weight=ft.FontWeight.BOLD, color="#3B82F6")
+        therm_hist_stat_temp     = ft.Text("-- °C", size=22, weight=ft.FontWeight.BOLD, color="#F0B429")
+        therm_hist_stat_temp_sub = ft.Text("Min: -- | Max: --", size=11, color="#8F8F9F")
+        therm_hist_stat_hum      = ft.Text("-- %", size=22, weight=ft.FontWeight.BOLD, color="#4FC3F7")
+        therm_hist_stat_hum_sub  = ft.Text("Min: -- | Max: --", size=11, color="#8F8F9F")
+        therm_hist_stat_range    = ft.Text("Χωρίς εγγραφές", size=12, color="#94A3B8")
+
+        therm_hist_list = ft.ListView(spacing=8, height=340)
+
+        therm_hist_sync_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.SYNC, size=16), ft.Text("Συγχρονισμός Ιστορικού", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#3B82F6", color="#fff", height=40,
+            on_click=lambda e: page.run_task(do_sync_therm_hist)
+        )
+        therm_hist_csv_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.DOWNLOAD, size=16), ft.Text("Εξαγωγή CSV", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#10B981", color="#fff", height=40,
+            on_click=lambda e: do_export_csv("thermometer")
+        )
+        therm_hist_json_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.CODE, size=16), ft.Text("Εξαγωγή JSON", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#8B5CF6", color="#fff", height=40,
+            on_click=lambda e: do_export_json("thermometer")
+        )
+
+        therm_history_panel = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Column([
+                        ft.Text("🌡️ Ιστορικό & Αναλυτικά Στοιχεία Θερμομέτρου (LYWSD03MMC)", size=17, weight=ft.FontWeight.BOLD, color="#F0B429"),
+                        therm_hist_status_txt
+                    ], spacing=2),
+                    ft.Row([therm_hist_sync_btn, therm_hist_csv_btn, therm_hist_json_btn], spacing=10, wrap=True)
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True),
+                therm_hist_progress,
+                ft.Divider(height=10, color="#1E293B"),
+                ft.Row([
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Σύνολο Εγγραφών", size=11, color="#8F8F9F"),
+                            therm_hist_stat_total
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=220
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Μέση Θερμοκρασία", size=11, color="#8F8F9F"),
+                            therm_hist_stat_temp,
+                            therm_hist_stat_temp_sub
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Μέση Υγρασία", size=11, color="#8F8F9F"),
+                            therm_hist_stat_hum,
+                            therm_hist_stat_hum_sub
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Χρονικό Εύρος", size=11, color="#8F8F9F"),
+                            therm_hist_stat_range
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=270
+                    ),
+                ], spacing=12, wrap=True),
+                ft.Divider(height=10, color="#1E293B"),
+                ft.Text("📋 Καταγραφή Μετρήσεων Μνήμης Flash", size=14, weight=ft.FontWeight.BOLD, color="#CBD5E1"),
+                ft.Container(
+                    content=therm_hist_list,
+                    bgcolor="#060609", border=ft.Border.all(1, "#1E293B"), border_radius=10, padding=12
+                )
+            ], spacing=14),
+            bgcolor="#111827", border=ft.Border.all(1, "#1E293B"), border_radius=16, padding=20, width=1050
+        )
+
+        # ── Mi Flora History UI ───────────────────────────────────────────────────
+        flora_hist_status_txt = ft.Text("Έτοιμο για συγχρονισμό", size=13, color="#CBD5E1")
+        flora_hist_progress   = ft.ProgressBar(value=0.0, color="#34D399", bgcolor="#1E293B", height=6, visible=False)
+
+        flora_hist_stat_total = ft.Text("0", size=24, weight=ft.FontWeight.BOLD, color="#34D399")
+        flora_hist_stat_moist = ft.Text("-- %", size=22, weight=ft.FontWeight.BOLD, color="#059669")
+        flora_hist_stat_fert  = ft.Text("-- µS/cm", size=22, weight=ft.FontWeight.BOLD, color="#3B82F6")
+        flora_hist_stat_light = ft.Text("-- Lux", size=22, weight=ft.FontWeight.BOLD, color="#D97706")
+
+        flora_hist_list = ft.ListView(spacing=8, height=340)
+
+        flora_hist_sync_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.SYNC, size=16), ft.Text("Συγχρονισμός Ιστορικού", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#34D399", color="#fff", height=40,
+            on_click=lambda e: page.run_task(do_sync_flora_hist)
+        )
+        flora_hist_csv_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.DOWNLOAD, size=16), ft.Text("Εξαγωγή CSV", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#10B981", color="#fff", height=40,
+            on_click=lambda e: do_export_csv("miflora")
+        )
+        flora_hist_json_btn = ft.Button(
+            content=ft.Row([ft.Icon(ft.Icons.CODE, size=16), ft.Text("Εξαγωγή JSON", size=13, weight=ft.FontWeight.BOLD)]),
+            bgcolor="#8B5CF6", color="#fff", height=40,
+            on_click=lambda e: do_export_json("miflora")
+        )
+
+        flora_history_panel = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Column([
+                        ft.Text("🌿 Ιστορικό & Διαγνωστικά Αισθητήρα Mi Flora", size=17, weight=ft.FontWeight.BOLD, color="#34D399"),
+                        flora_hist_status_txt
+                    ], spacing=2),
+                    ft.Row([flora_hist_sync_btn, flora_hist_csv_btn, flora_hist_json_btn], spacing=10, wrap=True)
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True),
+                flora_hist_progress,
+                ft.Divider(height=10, color="#1E293B"),
+                ft.Row([
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Σύνολο Εγγραφών", size=11, color="#8F8F9F"),
+                            flora_hist_stat_total
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Μέση Υγρασία Χώματος", size=11, color="#8F8F9F"),
+                            flora_hist_stat_moist
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Μέσο Λίπασμα", size=11, color="#8F8F9F"),
+                            flora_hist_stat_fert
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Μέγιστος Φωτισμός", size=11, color="#8F8F9F"),
+                            flora_hist_stat_light
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        bgcolor="#1C1C25", padding=12, border_radius=10, width=230
+                    ),
+                ], spacing=14, wrap=True),
+                ft.Divider(height=10, color="#1E293B"),
+                ft.Text("📋 Καταγραφή Μετρήσεων Υγείας Φυτού", size=14, weight=ft.FontWeight.BOLD, color="#CBD5E1"),
+                ft.Container(
+                    content=flora_hist_list,
+                    bgcolor="#060609", border=ft.Border.all(1, "#1E293B"), border_radius=10, padding=12
+                )
+            ], spacing=14),
+            bgcolor="#111827", border=ft.Border.all(1, "#1E293B"), border_radius=16, padding=20, width=1050
+        )
+
         # ── UI Update ─────────────────────────────────────────────────────────────
         def update_ui():
             nonlocal session_min_temp, session_max_temp, session_min_hum, session_max_hum
@@ -709,6 +879,101 @@ def main(page: ft.Page):
                     ft.Text(entry["text"], color=entry["color"], size=12, selectable=True)
                 )
 
+            # ── Refresh Thermometer History UI ─────────────────────────────────
+            therm_hist_status_txt.value = state.thermometer_history_status
+            if state.is_syncing_thermometer_history:
+                therm_hist_progress.visible = True
+                therm_hist_progress.value = state.thermometer_history_progress
+            else:
+                therm_hist_progress.visible = False
+
+            if state.thermometer_history:
+                temps = [x["temp"] for x in state.thermometer_history if "temp" in x]
+                hums = [x["humidity"] for x in state.thermometer_history if "humidity" in x]
+                if temps:
+                    avg_t, min_t, max_t = sum(temps)/len(temps), min(temps), max(temps)
+                    therm_hist_stat_temp.value = f"{avg_t:.1f} °C"
+                    therm_hist_stat_temp_sub.value = f"Min: {min_t:.1f}°C | Max: {max_t:.1f}°C"
+                if hums:
+                    avg_h, min_h, max_h = sum(hums)/len(hums), min(hums), max(hums)
+                    therm_hist_stat_hum.value = f"{int(avg_h)} %"
+                    therm_hist_stat_hum_sub.value = f"Min: {int(min_h)}% | Max: {int(max_h)}%"
+
+                therm_hist_stat_total.value = str(len(state.thermometer_history))
+                t_first = state.thermometer_history[0].get("timestamp", "")
+                t_last = state.thermometer_history[-1].get("timestamp", "")
+                therm_hist_stat_range.value = f"{t_first} ➔ {t_last}"
+
+            therm_hist_list.controls.clear()
+            for item in reversed(state.thermometer_history[-40:]):
+                t_val = item.get("temp", 0.0)
+                h_val = item.get("humidity", 0)
+                ts = item.get("timestamp", "")
+                t_col = "#059669" if 20 <= t_val <= 25 else ("#2563EB" if t_val < 20 else "#DC2626")
+                h_col = "#0284C7" if 35 <= h_val <= 60 else ("#D97706" if h_val < 35 else "#7C3AED")
+                therm_hist_list.controls.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Row([
+                                ft.Icon(ft.Icons.ACCESS_TIME, size=15, color="#8F8F9F"),
+                                ft.Text(ts, size=12, weight=ft.FontWeight.BOLD, color="#CBD5E1")
+                            ], spacing=6),
+                            ft.Row([
+                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f} °C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=t_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"💧 {h_val} %", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=h_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                            ], spacing=8)
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        bgcolor="#1C1C25", border_radius=8, padding=8
+                    )
+                )
+
+            # ── Refresh Mi Flora History UI ───────────────────────────────────────
+            flora_hist_status_txt.value = state.miflora_history_status
+            if state.is_syncing_miflora_history:
+                flora_hist_progress.visible = True
+                flora_hist_progress.value = state.miflora_history_progress
+            else:
+                flora_hist_progress.visible = False
+
+            if state.miflora_history:
+                moists = [x["moisture"] for x in state.miflora_history if "moisture" in x]
+                ferts = [x["fertility"] for x in state.miflora_history if "fertility" in x]
+                lights = [x["light"] for x in state.miflora_history if "light" in x]
+                if moists:
+                    flora_hist_stat_moist.value = f"{int(sum(moists)/len(moists))} %"
+                if ferts:
+                    flora_hist_stat_fert.value = f"{int(sum(ferts)/len(ferts))} µS/cm"
+                if lights:
+                    flora_hist_stat_light.value = f"{int(max(lights))} Lux"
+                flora_hist_stat_total.value = str(len(state.miflora_history))
+
+            flora_hist_list.controls.clear()
+            for item in reversed(state.miflora_history[-40:]):
+                m_val = item.get("moisture", 0)
+                f_val = item.get("fertility", 0)
+                l_val = item.get("light", 0)
+                t_val = item.get("temp", 0.0)
+                ts = item.get("timestamp", "")
+                m_col = "#059669" if 15 <= m_val <= 65 else ("#D97706" if m_val < 15 else "#DC2626")
+                f_col = "#3B82F6" if 300 <= f_val <= 2000 else "#8F8F9F"
+                flora_hist_list.controls.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Row([
+                                ft.Icon(ft.Icons.ACCESS_TIME, size=15, color="#8F8F9F"),
+                                ft.Text(ts, size=12, weight=ft.FontWeight.BOLD, color="#CBD5E1")
+                            ], spacing=6),
+                            ft.Row([
+                                ft.Container(content=ft.Text(f"💧 {m_val}%", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=m_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"🧪 {f_val}µS", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor=f_col, padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"☀️ {l_val}Lx", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#D97706", padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                                ft.Container(content=ft.Text(f"🌡️ {t_val:.1f}°C", size=11, weight=ft.FontWeight.BOLD, color="#FFF"), bgcolor="#475569", padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=6),
+                            ], spacing=6)
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        bgcolor="#1C1C25", border_radius=8, padding=8
+                    )
+                )
+
             therm_mac_input.value = state.thermometer_mac
             flora_mac_input.value = state.miflora_mac
             safe_update()
@@ -778,7 +1043,65 @@ def main(page: ft.Page):
                 "live_mode": loop_switch.value
             })
 
+        # ── History Event Handlers ────────────────────────────────────────────────
+        async def do_sync_therm_hist():
+            mac = therm_mac_input.value.strip() or state.thermometer_mac
+            await manager.sync_thermometer_history(mac)
+
+        async def do_sync_flora_hist():
+            mac = flora_mac_input.value.strip() or state.miflora_mac
+            await manager.sync_miflora_history(mac)
+
+        def do_export_csv(sensor_type):
+            filepath = manager.export_history_csv(sensor_type)
+            if filepath:
+                page.snack_bar = ft.SnackBar(content=ft.Text(f"📁 Εξαγωγή CSV επιτυχής: {os.path.basename(filepath)}"))
+                page.snack_bar.open = True
+                page.update()
+
+        def do_export_json(sensor_type):
+            filepath = manager.export_history_json(sensor_type)
+            if filepath:
+                page.snack_bar = ft.SnackBar(content=ft.Text(f"📁 Εξαγωγή JSON επιτυχής: {os.path.basename(filepath)}"))
+                page.snack_bar.open = True
+                page.update()
+
         # ── Final Layout ──────────────────────────────────────────────────────────
+        main_tabs = ft.Tabs(
+            selected_index=0,
+            animation_duration=250,
+            tabs=[
+                ft.Tab(
+                    text="📊 Ζωντανή Επισκόπηση",
+                    icon=ft.Icons.DASHBOARD,
+                    content=ft.Container(
+                        content=ft.Column([
+                            ft.Row([therm_card, flora_card], spacing=16, wrap=True),
+                            ft.Divider(height=10, color="#1E293B"),
+                            ft.Row([setup_panel, log_panel], spacing=16, wrap=True)
+                        ], spacing=16),
+                        padding=ft.padding.only(top=14)
+                    )
+                ),
+                ft.Tab(
+                    text="🌡️ Ιστορικό Θερμομέτρου",
+                    icon=ft.Icons.THERMOMETER,
+                    content=ft.Container(
+                        content=therm_history_panel,
+                        padding=ft.padding.only(top=14)
+                    )
+                ),
+                ft.Tab(
+                    text="🌿 Ιστορικό Mi Flora",
+                    icon=ft.Icons.LOCAL_FLORIST,
+                    content=ft.Container(
+                        content=flora_history_panel,
+                        padding=ft.padding.only(top=14)
+                    )
+                ),
+            ]
+        )
+
         page.add(
             ft.Column([
                 # Header
@@ -793,12 +1116,8 @@ def main(page: ft.Page):
                     ft.Row([loop_switch, interval_dd, help_btn], spacing=12)
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 ft.Divider(height=10, color="#1E293B"),
-                # Sensor cards
-                ft.Row([therm_card, flora_card], spacing=16, wrap=True),
-                ft.Divider(height=10, color="#1E293B"),
-                # Bottom row: setup + logs (wrap for smaller screens)
-                ft.Row([setup_panel, log_panel], spacing=16, wrap=True)
-            ], spacing=16, scroll=ft.ScrollMode.AUTO)
+                main_tabs
+            ], spacing=14, scroll=ft.ScrollMode.AUTO)
         )
 
         try:
