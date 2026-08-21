@@ -8,7 +8,7 @@ from config_manager import load_config, save_config
 from ble_manager import BLEState, BLEManager
 
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 
 def calc_dew_point(temp, hum):

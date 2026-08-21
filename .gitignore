@@ -8,3 +8,6 @@ config.json
 spyBLE.settings
 scratch/
 .tempmediaStorage/
+*.jpg
+spyble_*_history.json
+spyble_*_history.csv

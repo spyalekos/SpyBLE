@@ -103,38 +103,50 @@ class BLEManager:
             return
         
         self.state.is_scanning = True
-        self.log("Starting active BLE scan for 5 seconds...")
+        self.log("Starting active BLE scan for 7 seconds...")
         self.state.discovered_devices = []
         self.trigger_ui_update()
         
         try:
-            devices = await BleakScanner.discover(timeout=5.0, return_adv=True)
+            devices = await BleakScanner.discover(timeout=7.0, return_adv=True)
             discovered = []
             seen_macs = set()
 
             for address, (device, adv_data) in devices.items():
-                name = device.name or "Unknown Device"
+                raw_name = device.name or ""
                 rssi = adv_data.rssi
                 uuids = adv_data.service_uuids
                 
-                # Check for embedded hardware MAC in advertisement service data
+                # Check for embedded hardware MAC in advertisement service data or device name
                 payload_mac = self._extract_payload_mac(adv_data)
-                if payload_mac:
-                    self._device_cache[payload_mac.upper()] = device
-                    seen_macs.add(payload_mac.upper())
+                name_mac = self._extract_name_mac(raw_name)
+                hw_mac = payload_mac or name_mac or ""
+
+                # Enhanced name resolution
+                if not raw_name:
+                    if hw_mac or any("181a" in str(u).lower() or "fe95" in str(u).lower() for u in uuids):
+                        name = "LYWSD03MMC (Thermometer)"
+                    else:
+                        name = "Unknown Device"
+                else:
+                    name = raw_name
+
+                if hw_mac:
+                    self._device_cache[hw_mac.upper()] = device
+                    seen_macs.add(hw_mac.upper())
 
                 self._device_cache[address.upper()] = device
                 seen_macs.add(address.upper())
 
                 discovered.append({
                     "address": address,
-                    "hardware_mac": payload_mac or "",
+                    "hardware_mac": hw_mac,
                     "name": name,
                     "rssi": rssi,
                     "services": uuids
                 })
 
-            # Ensure configured MACs (Thermometer & Mi Flora) always appear in scan results!
+            # Ensure configured MACs (Thermometer & Mi Flora) appear in scan results if not already detected
             therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
             if therm_mac and therm_mac not in seen_macs:
                 discovered.insert(0, {
@@ -165,6 +177,19 @@ class BLEManager:
             self.state.is_scanning = False
             self.trigger_ui_update()
 
+    def _extract_name_mac(self, name: str):
+        """Extracts MAC from device advertising name like ATC_28EEF7 or LYWSD03MMC_A4C13828EEF7."""
+        if not name:
+            return None
+        name_clean = name.strip()
+        if name_clean.upper().startswith("ATC_"):
+            hex_part = name_clean[4:].replace(":", "").upper()
+            if len(hex_part) == 6:
+                return f"A4:C1:38:{hex_part[0:2]}:{hex_part[2:4]}:{hex_part[4:6]}"
+            elif len(hex_part) == 12:
+                return ":".join(hex_part[i:i+2] for i in range(0, 12, 2))
+        return None
+
     def _extract_payload_mac(self, adv_data):
         """Extracts hardware MAC address from ATC/PVVX or Xiaomi MiBeacon advertisement payload if available."""
         if not adv_data.service_data:
@@ -172,17 +197,31 @@ class BLEManager:
         
         for uuid_raw, data in adv_data.service_data.items():
             uuid_str = str(uuid_raw).lower()
-            if "181a" in uuid_str and len(data) >= 6: # ATC/PVVX payload
-                mac_bytes = data[:6]
+            # 1. ATC / PVVX payload (0x181A)
+            if "181a" in uuid_str and len(data) >= 6:
+                # In PVVX format, MAC is transmitted in Little-Endian (reversed byte order: data[5] == 0xA4 / Xiaomi OUI)
+                # In ATC1441 format, MAC is transmitted in Big-Endian (normal byte order: data[0] == 0xA4 / Xiaomi OUI)
+                if data[5] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4) or (len(data) >= 13 and data[12] in (8, 9, 10, 11, 12, 13)):
+                    mac_bytes = bytes(reversed(data[:6]))
+                elif data[0] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4):
+                    mac_bytes = data[:6]
+                else:
+                    # Fallback: check if reversing puts common OUI at the start
+                    if data[5] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4):
+                        mac_bytes = bytes(reversed(data[:6]))
+                    else:
+                        mac_bytes = bytes(reversed(data[:6]))
                 return ":".join(f"{b:02X}" for b in mac_bytes)
-            elif "fe95" in uuid_str and len(data) >= 10: # MiBeacon payload
+            
+            # 2. Xiaomi MiBeacon payload (0xFE95)
+            elif "fe95" in uuid_str and len(data) >= 10:
                 frame_ctrl = data[0] | (data[1] << 8)
-                if frame_ctrl & 0x10 and len(data) >= 11: # MAC bit set
+                if frame_ctrl & 0x10 and len(data) >= 11:  # MAC bit set
                     mac_bytes = bytes(reversed(data[5:11]))
                     return ":".join(f"{b:02X}" for b in mac_bytes)
         return None
 
-    async def _get_ble_device(self, target_mac: str, timeout: float = 2.5):
+    async def _get_ble_device(self, target_mac: str, timeout: float = 3.0):
         """Finds BLEDevice object required by Windows WinRT BLE stack."""
         clean_mac = target_mac.strip().upper().replace("-", ":")
         if not clean_mac:
@@ -203,16 +242,32 @@ class BLEManager:
 
         # 3. Discover scan to resolve random address / payload MAC match
         try:
+            clean_nodash = clean_mac.replace(":", "")
+            mac_tail4 = clean_nodash[-4:] if len(clean_nodash) >= 4 else ""
+            mac_tail6 = clean_nodash[-6:] if len(clean_nodash) >= 6 else ""
+
             devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
             for addr, (dev, adv_data) in devices.items():
                 addr_upper = addr.upper()
                 self._device_cache[addr_upper] = dev
                 payload_mac = self._extract_payload_mac(adv_data)
-                if payload_mac:
-                    self._device_cache[payload_mac.upper()] = dev
+                name_mac = self._extract_name_mac(dev.name)
+                
+                resolved_hw = (payload_mac or name_mac or "").upper()
+                if resolved_hw:
+                    self._device_cache[resolved_hw] = dev
 
-                if addr_upper == clean_mac or (payload_mac and payload_mac.upper() == clean_mac):
+                dev_name_upper = (dev.name or "").upper()
+                matched = (
+                    addr_upper == clean_mac
+                    or (resolved_hw and resolved_hw == clean_mac)
+                    or (mac_tail6 and mac_tail6 in dev_name_upper)
+                    or (mac_tail4 and mac_tail4 in dev_name_upper)
+                )
+
+                if matched:
                     self.log(f"Matched BLE Device: {dev.name or 'Unknown'} ({addr}) for MAC {clean_mac}", color="#FDCB6E")
+                    self._device_cache[clean_mac] = dev
                     return dev
         except Exception as e:
             logger.error(f"Error resolving BLE device: {e}")
@@ -392,14 +447,21 @@ class BLEManager:
             uuid_str = str(uuid_raw).lower()
 
             # 1. Custom ATC / PVVX format (UUID 0x181A)
-            if "181a" in uuid_str:
-                if len(data) >= 13: # ATC1441 format
-                    temp = int.from_bytes(data[6:8], byteorder='big', signed=True) / 10.0
-                    hum = data[8]
-                    batt_p = data[9]
-                    batt_mv = int.from_bytes(data[10:12], byteorder='big')
-                    res.update({"temp": temp, "humidity": hum, "battery_p": batt_p, "battery_v": batt_mv / 1000.0})
-                elif len(data) >= 10: # PVVX format
+            if "181a" in uuid_str and len(data) >= 10:
+                # Distinguish between PVVX (Little-Endian) and ATC1441 (Big-Endian)
+                is_pvvx = False
+                if len(data) >= 13:
+                    if data[5] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4) or data[12] in (8, 9, 10, 11, 12, 13):
+                        is_pvvx = True
+                    elif data[0] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4) or data[10] in (8, 9, 10, 11, 12, 13):
+                        is_pvvx = False
+                    else:
+                        is_pvvx = True  # Default for modern Telink custom firmware
+                else:
+                    is_pvvx = True
+
+                if is_pvvx:
+                    # PVVX format: Little-Endian, Temp / 100, Hum / 100
                     temp = int.from_bytes(data[6:8], byteorder='little', signed=True) / 100.0
                     hum = int.from_bytes(data[8:10], byteorder='little') / 100.0
                     res.update({"temp": temp, "humidity": hum})
@@ -407,6 +469,13 @@ class BLEManager:
                         res["battery_p"] = data[10]
                     if len(data) >= 13:
                         res["battery_v"] = int.from_bytes(data[11:13], byteorder='little') / 1000.0
+                elif len(data) >= 13:
+                    # ATC1441 format: Big-Endian, Temp / 10, Hum 1 byte
+                    temp = int.from_bytes(data[6:8], byteorder='big', signed=True) / 10.0
+                    hum = data[8]
+                    batt_p = data[9]
+                    batt_mv = int.from_bytes(data[10:12], byteorder='big')
+                    res.update({"temp": temp, "humidity": hum, "battery_p": batt_p, "battery_v": batt_mv / 1000.0})
 
             # 2. Standard Xiaomi MiBeacon (0xFE95)
             elif "fe95" in uuid_str:
