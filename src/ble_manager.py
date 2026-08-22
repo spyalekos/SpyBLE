@@ -98,6 +98,22 @@ class BLEManager:
             except Exception as e:
                 logger.error(f"Error in UI update callback: {e}")
 
+    async def _pause_passive_scanner(self):
+        """Temporarily stop passive scanner if running to prevent BlueZ org.bluez.Error.InProgress conflicts."""
+        if self._passive_scanner:
+            try:
+                await self._passive_scanner.stop()
+            except Exception as e:
+                logger.debug(f"Pause passive scanner exception: {e}")
+
+    async def _resume_passive_scanner(self):
+        """Resume passive scanner if background loop is running."""
+        if self._passive_scanner and self._loop_running:
+            try:
+                await self._passive_scanner.start()
+            except Exception as e:
+                logger.debug(f"Resume passive scanner exception: {e}")
+
     async def scan_devices(self):
         if self.state.is_scanning:
             return
@@ -106,6 +122,11 @@ class BLEManager:
         self.log("Starting active BLE scan for 7 seconds...")
         self.state.discovered_devices = []
         self.trigger_ui_update()
+        
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
         
         try:
             devices = await BleakScanner.discover(timeout=7.0, return_adv=True)
@@ -174,6 +195,8 @@ class BLEManager:
         except Exception as e:
             self.log(f"Scan failed with error: {str(e)}")
         finally:
+            if was_paused:
+                await self._resume_passive_scanner()
             self.state.is_scanning = False
             self.trigger_ui_update()
 
@@ -222,7 +245,7 @@ class BLEManager:
         return None
 
     async def _get_ble_device(self, target_mac: str, timeout: float = 3.0):
-        """Finds BLEDevice object required by Windows WinRT BLE stack."""
+        """Finds BLEDevice object required by Bluetooth stacks (WinRT & BlueZ)."""
         clean_mac = target_mac.strip().upper().replace("-", ":")
         if not clean_mac:
             return None
@@ -231,46 +254,74 @@ class BLEManager:
         if clean_mac in self._device_cache:
             return self._device_cache[clean_mac]
             
-        # 2. Try BleakScanner.find_device_by_address directly
+        # 2. Inspect active passive scanner discovered devices if present
+        if self._passive_scanner:
+            try:
+                devs = self._passive_scanner.discovered_devices_and_advertisement_data
+                for addr, (dev, adv_data) in devs.items():
+                    addr_upper = addr.upper()
+                    self._device_cache[addr_upper] = dev
+                    payload_mac = self._extract_payload_mac(adv_data)
+                    name_mac = self._extract_name_mac(dev.name)
+                    resolved_hw = (payload_mac or name_mac or "").upper()
+                    if resolved_hw:
+                        self._device_cache[resolved_hw] = dev
+            except Exception as e:
+                logger.debug(f"Error reading passive scanner devices: {e}")
+
+        if clean_mac in self._device_cache:
+            return self._device_cache[clean_mac]
+
+        # 3. Temporarily pause passive scanner to prevent BleakDBusError: [org.bluez.Error.InProgress]
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
+
         try:
-            device = await BleakScanner.find_device_by_address(clean_mac, timeout=timeout)
-            if device:
-                self._device_cache[clean_mac] = device
-                return device
-        except Exception:
-            pass
+            # Try BleakScanner.find_device_by_address directly
+            try:
+                device = await BleakScanner.find_device_by_address(clean_mac, timeout=timeout)
+                if device:
+                    self._device_cache[clean_mac] = device
+                    return device
+            except Exception:
+                pass
 
-        # 3. Discover scan to resolve random address / payload MAC match
-        try:
-            clean_nodash = clean_mac.replace(":", "")
-            mac_tail4 = clean_nodash[-4:] if len(clean_nodash) >= 4 else ""
-            mac_tail6 = clean_nodash[-6:] if len(clean_nodash) >= 6 else ""
+            # Discover scan to resolve random address / payload MAC match
+            try:
+                clean_nodash = clean_mac.replace(":", "")
+                mac_tail4 = clean_nodash[-4:] if len(clean_nodash) >= 4 else ""
+                mac_tail6 = clean_nodash[-6:] if len(clean_nodash) >= 6 else ""
 
-            devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
-            for addr, (dev, adv_data) in devices.items():
-                addr_upper = addr.upper()
-                self._device_cache[addr_upper] = dev
-                payload_mac = self._extract_payload_mac(adv_data)
-                name_mac = self._extract_name_mac(dev.name)
-                
-                resolved_hw = (payload_mac or name_mac or "").upper()
-                if resolved_hw:
-                    self._device_cache[resolved_hw] = dev
+                devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+                for addr, (dev, adv_data) in devices.items():
+                    addr_upper = addr.upper()
+                    self._device_cache[addr_upper] = dev
+                    payload_mac = self._extract_payload_mac(adv_data)
+                    name_mac = self._extract_name_mac(dev.name)
+                    
+                    resolved_hw = (payload_mac or name_mac or "").upper()
+                    if resolved_hw:
+                        self._device_cache[resolved_hw] = dev
 
-                dev_name_upper = (dev.name or "").upper()
-                matched = (
-                    addr_upper == clean_mac
-                    or (resolved_hw and resolved_hw == clean_mac)
-                    or (mac_tail6 and mac_tail6 in dev_name_upper)
-                    or (mac_tail4 and mac_tail4 in dev_name_upper)
-                )
+                    dev_name_upper = (dev.name or "").upper()
+                    matched = (
+                        addr_upper == clean_mac
+                        or (resolved_hw and resolved_hw == clean_mac)
+                        or (mac_tail6 and mac_tail6 in dev_name_upper)
+                        or (mac_tail4 and mac_tail4 in dev_name_upper)
+                    )
 
-                if matched:
-                    self.log(f"Matched BLE Device: {dev.name or 'Unknown'} ({addr}) for MAC {clean_mac}", color="#FDCB6E")
-                    self._device_cache[clean_mac] = dev
-                    return dev
-        except Exception as e:
-            logger.error(f"Error resolving BLE device: {e}")
+                    if matched:
+                        self.log(f"Matched BLE Device: {dev.name or 'Unknown'} ({addr}) for MAC {clean_mac}", color="#FDCB6E")
+                        self._device_cache[clean_mac] = dev
+                        return dev
+            except Exception as e:
+                logger.error(f"Error resolving BLE device: {e}")
+        finally:
+            if was_paused:
+                await self._resume_passive_scanner()
 
         return None
 
@@ -281,41 +332,60 @@ class BLEManager:
         clean_mac = mac.strip().upper().replace("-", ":")
         self.log(f"[Thermometer] 🚀 Rapid Shooting Mode started for {clean_mac} (max {max_retries} retries)...", color="#74B9FF")
         
-        for attempt in range(1, max_retries + 1):
-            if not self._loop_running:
-                break
-            
-            self.state.thermometer_status = f"Connecting ({attempt}/{max_retries})"
-            self.trigger_ui_update()
-            
-            # Resolve BLEDevice object for Windows stack compatibility
-            ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
-            target = ble_device if ble_device else clean_mac
-            
-            target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
-            self.log(f"[Thermometer] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
-            
-            try:
-                async with BleakClient(target, timeout=4.0) as client:
-                    self.log(f"[Thermometer] Connected on attempt #{attempt}! Reading characteristic...")
-                    char_uuid = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
-                    data = await client.read_gatt_char(char_uuid)
-                    
-                    if len(data) >= 5:
-                        temp = (data[0] | (data[1] << 8)) * 0.01
-                        humidity = data[2]
-                        battery_mv = (data[3] | (data[4] << 8))
-                        battery_v = battery_mv / 1000.0
-                        battery_p = max(0, min(100, int((battery_v - 2.2) / 0.8 * 100)))
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                if not self._loop_running:
+                    break
+                
+                self.state.thermometer_status = f"Connecting ({attempt}/{max_retries})"
+                self.trigger_ui_update()
+                
+                # Resolve BLEDevice object for Bluetooth stack compatibility
+                ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
+                target = ble_device if ble_device else clean_mac
+                
+                target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
+                self.log(f"[Thermometer] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
+                
+                # Check if passive updates already arrived
+                if self.state.thermometer_has_data and self.state.thermometer_temp is not None:
+                    self.log(f"[Thermometer] ✅ Data acquired via passive advertisements during rapid cycle!", color="#55E6C1")
+                    return self.state.thermometer_temp, self.state.thermometer_humidity, self.state.thermometer_battery_v, self.state.thermometer_battery_p
+
+                try:
+                    async with BleakClient(target, timeout=7.0) as client:
+                        self.log(f"[Thermometer] Connected on attempt #{attempt}! Reading characteristic...")
+                        char_uuid = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
+                        data = await client.read_gatt_char(char_uuid)
                         
-                        self.log(f"[Thermometer] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.2f}°C, Humidity: {humidity}%, Battery: {battery_v:.3f}V ({battery_p}%)", color="#55E6C1")
-                        return temp, humidity, battery_v, battery_p
-                    else:
-                        raise ValueError(f"Unexpected data length: {len(data)} bytes.")
-            except Exception as e:
-                err_msg = str(e) or "Connection timeout"
-                self.log(f"[Thermometer] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
-                await asyncio.sleep(retry_delay)
+                        if len(data) >= 5:
+                            temp = (data[0] | (data[1] << 8)) * 0.01
+                            humidity = data[2]
+                            battery_mv = (data[3] | (data[4] << 8))
+                            battery_v = battery_mv / 1000.0
+                            battery_p = max(0, min(100, int((battery_v - 2.2) / 0.8 * 100)))
+                            
+                            self.log(f"[Thermometer] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.2f}°C, Humidity: {humidity}%, Battery: {battery_v:.3f}V ({battery_p}%)", color="#55E6C1")
+                            return temp, humidity, battery_v, battery_p
+                        else:
+                            raise ValueError(f"Unexpected data length: {len(data)} bytes.")
+                except Exception as e:
+                    # Re-check if passive scanner filled the data while GATT attempt was in flight
+                    if self.state.thermometer_has_data and self.state.thermometer_temp is not None:
+                        self.log(f"[Thermometer] ✅ Passive advertisement received during GATT attempt!", color="#55E6C1")
+                        return self.state.thermometer_temp, self.state.thermometer_humidity, self.state.thermometer_battery_v, self.state.thermometer_battery_p
+
+                    err_msg = str(e) or "Connection timeout"
+                    self.log(f"[Thermometer] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
+                    await asyncio.sleep(retry_delay)
+        finally:
+            if was_paused:
+                await self._resume_passive_scanner()
 
         raise TimeoutError(f"Thermometer {clean_mac} failed to respond after {max_retries} rapid attempts.")
 
@@ -324,47 +394,56 @@ class BLEManager:
         clean_mac = mac.strip().upper().replace("-", ":")
         self.log(f"[Mi Flora] 🚀 Rapid Shooting Mode started for {clean_mac} (max {max_retries} retries)...", color="#74B9FF")
         
-        for attempt in range(1, max_retries + 1):
-            if not self._loop_running:
-                break
-            
-            self.state.miflora_status = f"Connecting ({attempt}/{max_retries})"
-            self.trigger_ui_update()
-            
-            ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
-            target = ble_device if ble_device else clean_mac
-            
-            target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
-            self.log(f"[Mi Flora] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
-            
-            try:
-                async with BleakClient(target, timeout=4.0) as client:
-                    mode_uuid = "00001a00-0000-1000-8000-00805f9b34fb"
-                    await client.write_gatt_char(mode_uuid, bytearray([0xA0, 0x1F]), response=True)
-                    
-                    data_uuid = "00001a01-0000-1000-8000-00805f9b34fb"
-                    data = await client.read_gatt_char(data_uuid)
-                    
-                    battery_uuid = "00001a02-0000-1000-8000-00805f9b34fb"
-                    battery_data = await client.read_gatt_char(battery_uuid)
-                    
-                    if len(data) >= 16:
-                        temp = int.from_bytes(data[0:2], byteorder='little') / 10.0
-                        light = int.from_bytes(data[3:7], byteorder='little')
-                        moisture = data[7]
-                        fertility = int.from_bytes(data[8:10], byteorder='little')
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                if not self._loop_running:
+                    break
+                
+                self.state.miflora_status = f"Connecting ({attempt}/{max_retries})"
+                self.trigger_ui_update()
+                
+                ble_device = await self._get_ble_device(clean_mac, timeout=1.5)
+                target = ble_device if ble_device else clean_mac
+                
+                target_desc = f"{ble_device.name or 'Device'} ({ble_device.address})" if ble_device else clean_mac
+                self.log(f"[Mi Flora] Rapid attempt #{attempt}/{max_retries} connecting to {target_desc}...")
+                
+                try:
+                    async with BleakClient(target, timeout=4.0) as client:
+                        mode_uuid = "00001a00-0000-1000-8000-00805f9b34fb"
+                        await client.write_gatt_char(mode_uuid, bytearray([0xA0, 0x1F]), response=True)
                         
-                        battery = battery_data[0] if len(battery_data) >= 1 else 0
-                        firmware = battery_data[1:].decode('ascii', errors='ignore').strip() if len(battery_data) > 1 else "Unknown"
+                        data_uuid = "00001a01-0000-1000-8000-00805f9b34fb"
+                        data = await client.read_gatt_char(data_uuid)
                         
-                        self.log(f"[Mi Flora] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.1f}°C, Moisture: {moisture}%, Light: {light} lux, Fertility: {fertility} µS/cm", color="#55E6C1")
-                        return temp, moisture, light, fertility, battery, firmware
-                    else:
-                        raise ValueError(f"Unexpected data length: {len(data)} bytes.")
-            except Exception as e:
-                err_msg = str(e) or "Connection timeout"
-                self.log(f"[Mi Flora] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
-                await asyncio.sleep(retry_delay)
+                        battery_uuid = "00001a02-0000-1000-8000-00805f9b34fb"
+                        battery_data = await client.read_gatt_char(battery_uuid)
+                        
+                        if len(data) >= 16:
+                            temp = int.from_bytes(data[0:2], byteorder='little') / 10.0
+                            light = int.from_bytes(data[3:7], byteorder='little')
+                            moisture = data[7]
+                            fertility = int.from_bytes(data[8:10], byteorder='little')
+                            
+                            battery = battery_data[0] if len(battery_data) >= 1 else 0
+                            firmware = battery_data[1:].decode('ascii', errors='ignore').strip() if len(battery_data) > 1 else "Unknown"
+                            
+                            self.log(f"[Mi Flora] ✅ SUCCESS on attempt #{attempt}! Temp: {temp:.1f}°C, Moisture: {moisture}%, Light: {light} lux, Fertility: {fertility} µS/cm", color="#55E6C1")
+                            return temp, moisture, light, fertility, battery, firmware
+                        else:
+                            raise ValueError(f"Unexpected data length: {len(data)} bytes.")
+                except Exception as e:
+                    err_msg = str(e) or "Connection timeout"
+                    self.log(f"[Mi Flora] Attempt #{attempt} failed ({err_msg}). Retrying in {int(retry_delay*1000)}ms...", color="#FFA502")
+                    await asyncio.sleep(retry_delay)
+        finally:
+            if was_paused:
+                await self._resume_passive_scanner()
 
         raise TimeoutError(f"Mi Flora {clean_mac} failed to respond after {max_retries} rapid attempts.")
 
@@ -377,6 +456,10 @@ class BLEManager:
         payload_mac = self._extract_payload_mac(adv_data)
         if payload_mac:
             self._device_cache[payload_mac.upper()] = device
+
+        name_mac = self._extract_name_mac(device.name)
+        if name_mac:
+            self._device_cache[name_mac.upper()] = device
 
         therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
         miflora_mac = self.state.miflora_mac.strip().upper().replace("-", ":")
@@ -508,10 +591,25 @@ class BLEManager:
         if len(data) < 5:
             return None
         frame_ctrl = data[0] | (data[1] << 8)
+        is_encrypted = bool(frame_ctrl & 0x08)
         has_mac = bool(frame_ctrl & 0x10)
-        offset = 11 if has_mac else 5
-        
+        has_capability = bool(frame_ctrl & 0x20)
+        has_event = bool(frame_ctrl & 0x40)
+
+        # If packet is encrypted without binding key, cannot decode payload events directly
+        if is_encrypted:
+            return None
+
+        offset = 5
+        if has_mac:
+            offset += 6
+        if has_capability:
+            offset += 1
+
         readings = {}
+        if not has_event:
+            return readings
+
         while offset + 3 <= len(data):
             event_id = data[offset] | (data[offset+1] << 8)
             event_len = data[offset+2]
@@ -615,13 +713,19 @@ class BLEManager:
 
         self.log("📡 [Method 3] Passive BLE Scanner active in background.")
         try:
-            scanner = BleakScanner(detection_callback=callback)
-            await scanner.start()
+            self._passive_scanner = BleakScanner(detection_callback=callback)
+            await self._passive_scanner.start()
             while self._loop_running:
                 await asyncio.sleep(1.0)
-            await scanner.stop()
         except Exception as e:
             logger.error(f"Passive scanner loop error: {e}")
+        finally:
+            if self._passive_scanner:
+                try:
+                    await self._passive_scanner.stop()
+                except Exception:
+                    pass
+                self._passive_scanner = None
 
     async def _thermometer_loop(self):
         await asyncio.sleep(1.0)
@@ -655,10 +759,13 @@ class BLEManager:
                         "last_seen": now_str
                     })
                 except Exception as e:
-                    self.state.thermometer_status = "Disconnected"
-                    self.log(f"[Thermometer] Rapid shooting paused ({str(e)}). Retrying cycle in 3s...")
-                    await asyncio.sleep(3.0)
-                    continue
+                    if self.state.thermometer_has_data:
+                        self.log(f"[Thermometer] Direct GATT rapid connect failed ({str(e)}), but passive advertisement data received!", color="#2ECC71")
+                    else:
+                        self.state.thermometer_status = "Disconnected"
+                        self.log(f"[Thermometer] Rapid shooting paused ({str(e)}). Waiting for passive advertisements or retry in 3s...")
+                        await asyncio.sleep(3.0)
+                        continue
 
             self.trigger_ui_update()
             
@@ -744,6 +851,11 @@ class BLEManager:
         self.trigger_ui_update()
         self.log(f"[Thermometer History] 📊 Σύνδεση στο {clean_mac} για ανάκτηση μνήμης...", color="#74B9FF")
 
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
+
         history_items = []
         try:
             ble_device = await self._get_ble_device(clean_mac, timeout=2.0)
@@ -791,6 +903,9 @@ class BLEManager:
                     "temp": t_val,
                     "humidity": h_val
                 })
+        finally:
+            if was_paused:
+                await self._resume_passive_scanner()
 
         if self.state.thermometer_temp is not None and self.state.thermometer_humidity is not None:
             history_items.append({
@@ -822,6 +937,11 @@ class BLEManager:
         self.state.miflora_history_progress = 0.1
         self.trigger_ui_update()
         self.log(f"[Mi Flora History] 🌿 Σύνδεση στο {clean_mac} για ανάκτηση μνήμης...", color="#74B9FF")
+
+        was_paused = False
+        if self._passive_scanner:
+            await self._pause_passive_scanner()
+            was_paused = True
 
         history_items = []
         try:
@@ -872,6 +992,9 @@ class BLEManager:
                     "light": max(100, min(10000, int(base_light + random.randint(-150, 150)))),
                     "fertility": max(50, min(3000, int(base_fert + random.randint(-20, 20))))
                 })
+        finally:
+            if was_paused:
+                await self._resume_passive_scanner()
 
         if self.state.miflora_moisture is not None:
             history_items.append({
