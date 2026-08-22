@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 import json
 import random
@@ -9,6 +10,9 @@ import time
 from datetime import datetime, timedelta
 from bleak import BleakClient, BleakScanner
 from config_manager import save_last_readings, save_history
+
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 
 # Set up simple logging
 logging.basicConfig(level=logging.INFO)
@@ -66,7 +70,79 @@ class BLEManager:
         self._loop = None
         self._loop_running = False
         self._passive_scanner = None
-        self._device_cache = {}  # Map: MAC address (upper) or Payload MAC -> BLEDevice
+        self._device_cache = {}  # Map: MAC address / aliases -> BLEDevice
+        self._mac_aliases = {}   # Map: Hardware MAC <-> OS/Windows Address
+
+    def _normalize_mac(self, mac: str) -> str:
+        if not mac:
+            return ""
+        return mac.strip().upper().replace("-", ":")
+
+    def _generate_mac_variants(self, mac: str) -> list:
+        clean = self._normalize_mac(mac)
+        if not clean:
+            return []
+        variants = [clean]
+        parts = clean.split(":")
+        if len(parts) == 6:
+            # 1. Byte-reversed MAC (Little-Endian <-> Big-Endian full reverse)
+            rev_mac = ":".join(reversed(parts))
+            if rev_mac not in variants:
+                variants.append(rev_mac)
+            
+            # 2. Swap last byte nibbles (e.g. F7 <-> 7F)
+            last_byte = parts[5]
+            if len(last_byte) == 2:
+                swapped_last = last_byte[1] + last_byte[0]
+                swapped_mac = ":".join(parts[:5] + [swapped_last])
+                if swapped_mac not in variants:
+                    variants.append(swapped_mac)
+            
+            # 3. Swap Telink Little-Endian last 3 bytes (e.g. 28:EE:F7 <-> F7:EE:28)
+            telink_rev_tail = ":".join(parts[:3] + list(reversed(parts[3:])))
+            if telink_rev_tail not in variants:
+                variants.append(telink_rev_tail)
+
+        return variants
+
+    def _cache_device_all_aliases(self, device, adv_data=None):
+        if not device:
+            return
+        addr = self._normalize_mac(device.address)
+        if addr:
+            self._device_cache[addr] = device
+
+        hw_mac = ""
+        if adv_data:
+            payload_mac = self._extract_payload_mac(adv_data)
+            if payload_mac:
+                norm_payload = self._normalize_mac(payload_mac)
+                self._device_cache[norm_payload] = device
+                hw_mac = norm_payload
+
+        name_mac = self._extract_name_mac(device.name)
+        if name_mac:
+            norm_name = self._normalize_mac(name_mac)
+            self._device_cache[norm_name] = device
+            if not hw_mac:
+                hw_mac = norm_name
+
+        # Map cross-aliases
+        all_keys = [addr]
+        if hw_mac:
+            all_keys.append(hw_mac)
+            all_keys.extend(self._generate_mac_variants(hw_mac))
+        if name_mac:
+            all_keys.extend(self._generate_mac_variants(self._normalize_mac(name_mac)))
+        all_keys.extend(self._generate_mac_variants(addr))
+
+        for k in all_keys:
+            if k:
+                self._device_cache[k] = device
+                if addr:
+                    self._mac_aliases[k] = addr
+                if hw_mac and k != hw_mac:
+                    self._mac_aliases[k] = hw_mac
 
     def log(self, message: str, color: str = None):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -119,7 +195,8 @@ class BLEManager:
             return
         
         self.state.is_scanning = True
-        self.log("Starting active BLE scan for 7 seconds...")
+        os_label = "Windows (WinRT)" if IS_WINDOWS else "Linux (BlueZ)"
+        self.log(f"Starting active BLE scan for 7 seconds [{os_label}]...")
         self.state.discovered_devices = []
         self.trigger_ui_update()
         
@@ -152,37 +229,56 @@ class BLEManager:
                 else:
                     name = raw_name
 
+                self._cache_device_all_aliases(device, adv_data)
+                seen_macs.add(address.upper())
                 if hw_mac:
-                    self._device_cache[hw_mac.upper()] = device
                     seen_macs.add(hw_mac.upper())
 
-                self._device_cache[address.upper()] = device
-                seen_macs.add(address.upper())
+                # Distinguish target address & display presentation between Windows and Linux
+                if IS_WINDOWS:
+                    platform_target = address  # Windows requires the OS Bluetooth address for GATT connections
+                    if hw_mac and hw_mac.upper() != address.upper():
+                        display_mac = f"Win: {address} | HW: {hw_mac}"
+                    else:
+                        display_mac = address
+                else:
+                    platform_target = hw_mac if hw_mac else address
+                    if hw_mac and hw_mac.upper() != address.upper():
+                        display_mac = f"Linux/HW: {hw_mac} (Dev: {address})"
+                    else:
+                        display_mac = address
 
                 discovered.append({
                     "address": address,
                     "hardware_mac": hw_mac,
+                    "name_mac": name_mac,
+                    "platform_target": platform_target,
+                    "display_mac": display_mac,
                     "name": name,
                     "rssi": rssi,
                     "services": uuids
                 })
 
             # Ensure configured MACs (Thermometer & Mi Flora) appear in scan results if not already detected
-            therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
+            therm_mac = self._normalize_mac(self.state.thermometer_mac)
             if therm_mac and therm_mac not in seen_macs:
                 discovered.insert(0, {
                     "address": therm_mac,
                     "hardware_mac": therm_mac,
+                    "platform_target": therm_mac,
+                    "display_mac": f"Configured: {therm_mac}",
                     "name": "LYWSD03MMC (Configured Thermometer)",
                     "rssi": 0,
                     "services": []
                 })
 
-            flora_mac = self.state.miflora_mac.strip().upper().replace("-", ":")
+            flora_mac = self._normalize_mac(self.state.miflora_mac)
             if flora_mac and flora_mac not in seen_macs:
                 discovered.insert(0, {
                     "address": flora_mac,
                     "hardware_mac": flora_mac,
+                    "platform_target": flora_mac,
+                    "display_mac": f"Configured: {flora_mac}",
                     "name": "Mi Flora (Configured Sensor)",
                     "rssi": 0,
                     "services": []
@@ -201,7 +297,7 @@ class BLEManager:
             self.trigger_ui_update()
 
     def _extract_name_mac(self, name: str):
-        """Extracts MAC from device advertising name like ATC_28EEF7 or LYWSD03MMC_A4C13828EEF7."""
+        """Extracts MAC from device advertising name like ATC_28EEF7, ATC_28EE7F or LYWSD03MMC_A4C13828EEF7."""
         if not name:
             return None
         name_clean = name.strip()
@@ -229,11 +325,7 @@ class BLEManager:
                 elif data[0] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4):
                     mac_bytes = data[:6]
                 else:
-                    # Fallback: check if reversing puts common OUI at the start
-                    if data[5] in (0xA4, 0x58, 0x4C, 0x5C, 0xE4):
-                        mac_bytes = bytes(reversed(data[:6]))
-                    else:
-                        mac_bytes = bytes(reversed(data[:6]))
+                    mac_bytes = bytes(reversed(data[:6]))
                 return ":".join(f"{b:02X}" for b in mac_bytes)
             
             # 2. Xiaomi MiBeacon payload (0xFE95)
@@ -246,49 +338,55 @@ class BLEManager:
 
     async def _get_ble_device(self, target_mac: str, timeout: float = 3.0):
         """Finds BLEDevice object required by Bluetooth stacks (WinRT & BlueZ)."""
-        clean_mac = target_mac.strip().upper().replace("-", ":")
+        clean_mac = self._normalize_mac(target_mac)
         if not clean_mac:
             return None
             
-        # 1. Check active cache
+        # 1. Check direct cache or known aliases
         if clean_mac in self._device_cache:
             return self._device_cache[clean_mac]
+
+        if clean_mac in self._mac_aliases:
+            alias_addr = self._mac_aliases[clean_mac]
+            if alias_addr in self._device_cache:
+                return self._device_cache[alias_addr]
+
+        for var in self._generate_mac_variants(clean_mac):
+            if var in self._device_cache:
+                return self._device_cache[var]
+            if var in self._mac_aliases and self._mac_aliases[var] in self._device_cache:
+                return self._device_cache[self._mac_aliases[var]]
             
         # 2. Inspect active passive scanner discovered devices if present
         if self._passive_scanner:
             try:
                 devs = self._passive_scanner.discovered_devices_and_advertisement_data
                 for addr, (dev, adv_data) in devs.items():
-                    addr_upper = addr.upper()
-                    self._device_cache[addr_upper] = dev
-                    payload_mac = self._extract_payload_mac(adv_data)
-                    name_mac = self._extract_name_mac(dev.name)
-                    resolved_hw = (payload_mac or name_mac or "").upper()
-                    if resolved_hw:
-                        self._device_cache[resolved_hw] = dev
+                    self._cache_device_all_aliases(dev, adv_data)
             except Exception as e:
                 logger.debug(f"Error reading passive scanner devices: {e}")
 
         if clean_mac in self._device_cache:
             return self._device_cache[clean_mac]
 
-        # 3. Temporarily pause passive scanner to prevent BleakDBusError: [org.bluez.Error.InProgress]
+        # 3. Temporarily pause passive scanner to prevent Bleak conflicts
         was_paused = False
         if self._passive_scanner:
             await self._pause_passive_scanner()
             was_paused = True
 
         try:
-            # Try BleakScanner.find_device_by_address directly
-            try:
-                device = await BleakScanner.find_device_by_address(clean_mac, timeout=timeout)
-                if device:
-                    self._device_cache[clean_mac] = device
-                    return device
-            except Exception:
-                pass
+            # Try BleakScanner.find_device_by_address directly for target or variants
+            for search_mac in [clean_mac] + self._generate_mac_variants(clean_mac):
+                try:
+                    device = await BleakScanner.find_device_by_address(search_mac, timeout=min(timeout, 1.5))
+                    if device:
+                        self._cache_device_all_aliases(device)
+                        return device
+                except Exception:
+                    pass
 
-            # Discover scan to resolve random address / payload MAC match
+            # Discover scan to resolve random address / payload MAC / name match
             try:
                 clean_nodash = clean_mac.replace(":", "")
                 mac_tail4 = clean_nodash[-4:] if len(clean_nodash) >= 4 else ""
@@ -296,26 +394,26 @@ class BLEManager:
 
                 devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
                 for addr, (dev, adv_data) in devices.items():
-                    addr_upper = addr.upper()
-                    self._device_cache[addr_upper] = dev
-                    payload_mac = self._extract_payload_mac(adv_data)
-                    name_mac = self._extract_name_mac(dev.name)
-                    
-                    resolved_hw = (payload_mac or name_mac or "").upper()
-                    if resolved_hw:
-                        self._device_cache[resolved_hw] = dev
+                    self._cache_device_all_aliases(dev, adv_data)
 
+                    payload_mac = self._extract_payload_mac(adv_data) or ""
+                    name_mac = self._extract_name_mac(dev.name) or ""
+                    resolved_hw = self._normalize_mac(payload_mac or name_mac)
+                    addr_upper = self._normalize_mac(addr)
                     dev_name_upper = (dev.name or "").upper()
+                    variants = self._generate_mac_variants(clean_mac)
+
                     matched = (
                         addr_upper == clean_mac
-                        or (resolved_hw and resolved_hw == clean_mac)
-                        or (mac_tail6 and mac_tail6 in dev_name_upper)
-                        or (mac_tail4 and mac_tail4 in dev_name_upper)
+                        or addr_upper in variants
+                        or (resolved_hw and (resolved_hw == clean_mac or resolved_hw in variants))
+                        or (mac_tail6 and (mac_tail6 in dev_name_upper or mac_tail6 in addr_upper.replace(":", "")))
+                        or (mac_tail4 and (mac_tail4 in dev_name_upper or mac_tail4 in addr_upper.replace(":", "")))
                     )
 
                     if matched:
-                        self.log(f"Matched BLE Device: {dev.name or 'Unknown'} ({addr}) for MAC {clean_mac}", color="#FDCB6E")
-                        self._device_cache[clean_mac] = dev
+                        self.log(f"Matched BLE Device: {dev.name or 'Unknown'} (OS: {addr} | HW: {resolved_hw or 'N/A'}) for MAC {clean_mac}", color="#FDCB6E")
+                        self._cache_device_all_aliases(dev, adv_data)
                         return dev
             except Exception as e:
                 logger.error(f"Error resolving BLE device: {e}")
@@ -450,23 +548,42 @@ class BLEManager:
     # ── Method 3: Passive BLE Advertisement Decoder ─────────────────────────
 
     def _parse_passive_adv(self, device, adv_data):
-        addr = device.address.upper()
-        self._device_cache[addr] = device
+        self._cache_device_all_aliases(device, adv_data)
+        addr = self._normalize_mac(device.address)
         
-        payload_mac = self._extract_payload_mac(adv_data)
-        if payload_mac:
-            self._device_cache[payload_mac.upper()] = device
+        payload_mac = self._normalize_mac(self._extract_payload_mac(adv_data) or "")
+        name_mac = self._normalize_mac(self._extract_name_mac(device.name) or "")
 
-        name_mac = self._extract_name_mac(device.name)
-        if name_mac:
-            self._device_cache[name_mac.upper()] = device
-
-        therm_mac = self.state.thermometer_mac.strip().upper().replace("-", ":")
-        miflora_mac = self.state.miflora_mac.strip().upper().replace("-", ":")
+        therm_mac = self._normalize_mac(self.state.thermometer_mac)
+        miflora_mac = self._normalize_mac(self.state.miflora_mac)
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        # Match Thermometer MAC (by OS Bluetooth address OR by hardware payload MAC)
-        if therm_mac and (addr == therm_mac or (payload_mac and payload_mac.upper() == therm_mac)):
+        def matches_configured(target_mac):
+            if not target_mac:
+                return False
+            t_vars = set(self._generate_mac_variants(target_mac))
+            t_nodash = target_mac.replace(":", "")
+            t_tail4 = t_nodash[-4:] if len(t_nodash) >= 4 else ""
+            t_tail6 = t_nodash[-6:] if len(t_nodash) >= 6 else ""
+
+            if addr == target_mac or addr in t_vars:
+                return True
+            if payload_mac and (payload_mac == target_mac or payload_mac in t_vars):
+                return True
+            if name_mac and (name_mac == target_mac or name_mac in t_vars):
+                return True
+            if target_mac in self._mac_aliases and (self._mac_aliases[target_mac] == addr or self._mac_aliases[target_mac] == payload_mac):
+                return True
+            if addr in self._mac_aliases and (self._mac_aliases[addr] == target_mac or self._mac_aliases[addr] in t_vars):
+                return True
+            if t_tail6 and (t_tail6 in (device.name or "").upper() or t_tail6 in addr.replace(":", "")):
+                return True
+            if t_tail4 and (t_tail4 in (device.name or "").upper() or t_tail4 in addr.replace(":", "")):
+                return True
+            return False
+
+        # Match Thermometer MAC (by OS Bluetooth address, hardware payload MAC, or cross-platform alias)
+        if therm_mac and matches_configured(therm_mac):
             parsed = self._decode_thermometer_adv(adv_data)
             if parsed:
                 if "temp" in parsed and parsed["temp"] is not None:
@@ -494,7 +611,7 @@ class BLEManager:
                 self.trigger_ui_update()
 
         # Match Mi Flora MAC
-        if miflora_mac and (addr == miflora_mac or (payload_mac and payload_mac.upper() == miflora_mac)):
+        if miflora_mac and matches_configured(miflora_mac):
             parsed = self._decode_miflora_adv(adv_data)
             if parsed:
                 if "temp" in parsed: self.state.miflora_temp = parsed["temp"]

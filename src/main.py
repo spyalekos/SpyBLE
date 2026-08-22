@@ -8,7 +8,7 @@ from config_manager import load_config, save_config
 from ble_manager import BLEState, BLEManager
 
 
-VERSION = "2.0.5"
+VERSION = "2.0.6"
 
 
 def calc_dew_point(temp, hum):
@@ -850,13 +850,9 @@ def main(page: ft.Page):
                 return lambda e: assign_mac(mac_addr, sensor_type)
 
             for dev in state.discovered_devices:
-                hw_mac = dev.get("hardware_mac", "")
-                target_mac = hw_mac if hw_mac else dev["address"]
-                
-                if hw_mac and hw_mac != dev["address"]:
-                    mac_subtitle = f"HW: {hw_mac} (Win: {dev['address']})  RSSI: {dev['rssi']} dBm"
-                else:
-                    mac_subtitle = f"{dev['address']}  RSSI: {dev['rssi']} dBm"
+                target_mac = dev.get("platform_target") or dev["address"]
+                display_info = dev.get("display_mac") or dev["address"]
+                mac_subtitle = f"{display_info}  RSSI: {dev['rssi']} dBm"
 
                 device_list.controls.append(
                     ft.Container(
